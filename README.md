@@ -3,7 +3,7 @@
 本地打开：
 
 ```text
-E:\Tools\TextLayerRebuilder\start.cmd
+.\start.cmd
 ```
 
 默认地址：
