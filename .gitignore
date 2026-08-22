@@ -1,0 +1,15 @@
+.cache/
+.vendor/
+tmp/
+__pycache__/
+*.py[cod]
+*.pdf
+*.epub
+*.zip
+*.log
+.env
+.env.*
+desktop-pipeline.png
+mobile-pipeline.png
+activation-ui.png
+

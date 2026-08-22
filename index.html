@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>文本精准定位古籍</title>
+  <link rel="icon" href="assets/favicon.png?v=20260820-ui6" type="image/png">
+  <link rel="shortcut icon" href="assets/app-icon.ico?v=20260820-ui6">
+  <link rel="apple-touch-icon" href="assets/app-icon-192.png?v=20260820-ui6">
+  <link rel="stylesheet" href="styles.css?v=20260822-pipeline2">
+</head>
+<body>
+  <div class="app">
+    <header class="app-header">
+      <div class="brand">
+        <img class="app-icon" src="assets/app-icon.png?v=20260819-ui5" width="42" height="42" alt="" aria-hidden="true">
+        <div>
+          <h1>文本精准定位古籍</h1>
+        </div>
+      </div>
+      <section class="status-panel" aria-live="polite">
+        <div class="status-dot" id="engineDot"></div>
+        <div>
+          <strong id="engineTitle">本地服务检查中</strong>
+          <p id="engineDetail">正在唤醒工具</p>
+        </div>
+      </section>
+      <div class="top-actions">
+        <button class="icon-button" type="button" data-action="theme" title="切换底色">◐</button>
+        <a class="icon-button" href="README.md" title="说明">?</a>
+      </div>
+    </header>
+
+    <main class="workspace">
+      <section class="work-grid" aria-label="文字定位工作台">
+        <section class="panel import-panel" aria-label="材料与操作">
+          <div class="panel-head">
+            <h3>放入材料</h3>
+            <span id="jobBadge">未创建任务</span>
+          </div>
+
+          <form id="importForm" class="import-form">
+            <label class="drop-zone">
+              <input id="pdfFile" name="pdf" type="file" accept="application/pdf,.pdf" required>
+              <strong>选择影印 PDF</strong>
+              <span id="pdfName">纯扫描或已有文字的 PDF 都可以</span>
+            </label>
+
+            <div class="source-tabs" role="tablist" aria-label="文本来源">
+              <button class="source-tab active" type="button" data-source="file">本地文本</button>
+              <button class="source-tab" type="button" data-source="url">网页链接</button>
+              <button class="source-tab" type="button" data-source="none">先不放</button>
+            </div>
+
+            <label class="field source-field" data-source-field="file">
+              <span id="sourceFileLabel">用于校准的文本</span>
+              <input id="sourceFile" name="source_file" type="file" accept=".txt,.md,.html,.xhtml,.epub,text/plain,text/html,application/epub+zip">
+            </label>
+
+            <label class="field source-field hidden" data-source-field="url">
+              <span>文本网页</span>
+              <input id="sourceUrl" name="source_url" type="url" placeholder="https://www.zhonghuashu.com/wiki/...">
+            </label>
+
+            <div class="layout-grid">
+              <label class="field">
+                <span>页面样子</span>
+                <select id="layoutMode" name="layout">
+                  <option value="auto">自动判断</option>
+                  <option value="vertical-double">竖排上下双页</option>
+                  <option value="vertical-single">竖排单页</option>
+                  <option value="horizontal">横排</option>
+                </select>
+              </label>
+
+              <label class="field">
+                <span>先看第几页</span>
+                <input id="trialPage" name="trial_page" type="number" min="1" value="100">
+              </label>
+            </div>
+
+            <button class="primary" type="submit">开始整理</button>
+          </form>
+
+          <div id="summaryCards" class="summary-cards" hidden></div>
+          <div id="messages" class="messages" hidden></div>
+          <div class="run-actions" aria-label="运行操作">
+              <button class="secondary" id="runTrial" type="button" disabled>先试一页</button>
+              <button class="secondary" id="runFull" type="button" disabled>生成整本</button>
+              <button class="secondary" id="pauseFull" type="button" disabled>暂停</button>
+          </div>
+        </section>
+
+        <section class="panel preview-panel" aria-label="预览">
+          <div class="panel-head">
+            <h3>预览</h3>
+          </div>
+          <div id="preview" class="preview">
+            <div class="empty-preview">
+              <span class="seal large">页</span>
+              <strong>等待试页</strong>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel output-panel" aria-label="进度与输出">
+          <div class="panel-head">
+            <h3>进度与输出</h3>
+            <div class="output-head-actions">
+              <span id="outputState">暂无输出</span>
+              <button class="mini-button" id="cleanupJob" type="button" disabled>清理缓存</button>
+            </div>
+          </div>
+          <div class="progress-wrap" id="fullProgress" hidden>
+            <div class="progress-head">
+              <strong id="progressTitle">整本处理中</strong>
+              <div class="progress-controls">
+                <span id="progressText">0%</span>
+                <button class="progress-activate" id="activateProgress" type="button" hidden>开始运行</button>
+                <button class="progress-pause" id="pauseProgress" type="button" disabled>暂停</button>
+              </div>
+            </div>
+            <progress id="progressBar" max="100" value="0"></progress>
+            <p id="progressDetail">任务会在本地继续运行。</p>
+            <div class="pipeline-stages" id="pipelineStages" hidden></div>
+          </div>
+          <div id="outputs" class="outputs">
+            <p>暂无输出。</p>
+          </div>
+        </section>
+      </section>
+    </main>
+  </div>
+
+  <script src="script.js?v=20260822-pipeline4"></script>
+</body>
+</html>
