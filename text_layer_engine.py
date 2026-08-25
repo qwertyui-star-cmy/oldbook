@@ -94,8 +94,8 @@ TEXT_FONT = "HanText"
 TEXT_FONT_REGISTERED = False
 EXTB_TEXT_FONT = "HanTextExtB"
 EXTB_TEXT_FONT_REGISTERED = False
-LAYOUT_ENGINE_VERSION = "vertical-strict-edge-v17-boundary-review"
-ANCHOR_CACHE_VERSION = 10
+LAYOUT_ENGINE_VERSION = "next-page-start-v18-mixed-output"
+ANCHOR_CACHE_VERSION = 11
 TEXT_FONT_CANDIDATES = [
     Path(r"C:\Windows\Fonts\STSONG.TTF"),
     Path(r"C:\Windows\Fonts\simsun.ttc"),
@@ -127,7 +127,7 @@ PIPELINE_STAGES = (
     ("input", "来源与任务检查"),
     ("ocr", "页边 OCR 缓存"),
     ("align", "权威正文逐页锁定"),
-    ("classify", "未收录页判定"),
+    ("classify", "非权威页整页 OCR"),
     ("layer", "文字层逐页写入"),
     ("assemble", "整本 PDF 合并"),
     ("text-check", "连续搜索与文字校验"),
@@ -1689,7 +1689,7 @@ def page_text_from_sources(job: dict, page_no: int, layout: str | None = None, r
     pdf_path = Path(job["pdf"])
     reader = PdfReader(str(pdf_path), strict=False)
     selected_layout = layout or job.get("layout", "auto")
-    resolved = resolve_page(job, reader, page_no, selected_layout, allow_discovery=True)
+    resolved = resolve_trial_page_by_next_start(job, reader, page_no, selected_layout)
     if require_anchor_for_scan and resolved.get("kind") == "unresolved":
         return ""
     return str(resolved.get("text") or "")
@@ -2276,15 +2276,17 @@ def ocr_anchor_crops(
         end_runs = text_column_runs(image, end_block["inner"])
     else:
         start_runs, end_runs = edge_runs
-    start_col = start_runs[-1] if start_runs else (six1 - 70, six1)
-    end_col = end_runs[0] if end_runs else (eix0, eix0 + 70)
-    start_width = max(80, min(190, (start_col[1] - start_col[0]) * units + 34))
-    end_width = max(80, min(190, (end_col[1] - end_col[0]) * units + 34))
-    start_right = min(six1, max(six0 + 1, start_col[1] + 8))
-    start_left = max(six0, min(start_right - 1, start_col[1] - start_width))
+    start_columns = start_runs[-max(1, units):] if start_runs else [(six1 - 70 * units, six1)]
+    end_columns = end_runs[:max(1, units)] if end_runs else [(eix0, eix0 + 70 * units)]
+    start_left_edge = min(column[0] for column in start_columns)
+    start_right_edge = max(column[1] for column in start_columns)
+    end_left_edge = min(column[0] for column in end_columns)
+    end_right_edge = max(column[1] for column in end_columns)
+    start_right = min(six1, max(six0 + 1, start_right_edge + 8))
+    start_left = max(six0, min(start_right - 1, start_left_edge - 18))
     edge_pad = max(40, round(image.width * 0.10))
-    end_left = max(0, min(eix1 - 1, end_col[0] - edge_pad))
-    end_right = min(eix1, max(end_left + 1, end_col[0] + end_width))
+    end_left = max(0, min(eix1 - 1, end_left_edge - edge_pad))
+    end_right = min(eix1, max(end_left + 1, end_right_edge + 18))
     return [
         image.crop(valid_box(start_left, siy0 - 70, start_right, siy1 + 35)),
         image.crop(valid_box(end_left, eiy0 - 70, end_right, eiy1 + 35)),
@@ -2353,7 +2355,7 @@ def ocr_page_anchor_pair(
         normalized, _ = normalize_for_match(text)
         side = "start" if index == 1 else "end"
         source_match = anchor_present_in_source_corpus(source_corpus, text, side)
-        if len(normalized) < 4 or not source_match:
+        if len(normalized) <= 4 or not source_match:
             chunks[index - 1] = expanded_texts.get(index) or text
     while len(chunks) < 2:
         chunks.append("")
@@ -2436,16 +2438,22 @@ def anchor_cache_ready(job_id: str, page_no: int, layout: str, input_fingerprint
 
 
 def adaptive_ocr_workers(requested: int | None = None) -> int:
-    override = str(os.environ.get("TEXT_LAYER_OCR_WORKERS") or "").strip()
-    if override.isdigit():
-        return max(1, min(8, int(override)))
     logical_cpus = os.cpu_count() or 4
-    automatic = max(2, min(4, logical_cpus // 3))
+    # OCR engines are both CPU- and memory-heavy. Always leave at least two
+    # logical CPUs for Windows, the browser, and the local web service.
+    cpu_limit = max(1, min(4, logical_cpus - 2, max(1, logical_cpus // 3)))
+    automatic = cpu_limit
     available_mb = available_memory_mb()
     if available_mb:
-        memory_limit = max(1, min(4, int(max(0, available_mb - 1200) // 850)))
+        # Reserve 2 GiB for the operating system and budget about 1.2 GiB for
+        # each OCR process. This deliberately prefers a slower healthy run to
+        # paging or terminating a large-book job.
+        memory_limit = max(1, min(4, int(max(0, available_mb - 2048) // 1200)))
         automatic = min(automatic, memory_limit)
-    return min(automatic, requested) if requested else automatic
+    override = str(os.environ.get("TEXT_LAYER_OCR_WORKERS") or "").strip()
+    if override.isdigit():
+        automatic = min(automatic, max(1, int(override)))
+    return max(1, min(automatic, requested)) if requested else max(1, automatic)
 
 
 def available_memory_mb() -> int:
@@ -2563,7 +2571,11 @@ def precompute_anchor_cache(
         pending = set()
 
         def fill_worker_queue() -> None:
-            while len(pending) < worker_count * 2:
+            # Re-evaluate memory before dispatching more pages. Existing work is
+            # allowed to finish, while new work is throttled when RAM becomes
+            # scarce during a long book.
+            current_limit = adaptive_ocr_workers(worker_count)
+            while len(pending) < current_limit:
                 try:
                     batch = next(page_queue)
                 except StopIteration:
@@ -2770,10 +2782,6 @@ def page_anchor_text(job: dict, reader: PdfReader, page_no: int, layout: str) ->
     job_id = str(job.get("id") or "").strip()
     if job_id and anchor_cache_ready(job_id, page_no, layout, str(job.get("inputFingerprint") or "")):
         return ocr_page_text(job, page_no, layout, anchors_only=True)
-    extracted = reader.pages[page_no - 1].extract_text() or ""
-    normalized, _ = normalize_for_match(extracted)
-    if len(normalized) >= 16:
-        return extracted
     return ocr_page_text(job, page_no, layout, anchors_only=True)
 
 
@@ -2781,11 +2789,8 @@ def page_anchor_pair(job: dict, reader: PdfReader, page_no: int, layout: str) ->
     job_id = str(job.get("id") or "").strip()
     if job_id and anchor_cache_ready(job_id, page_no, layout, str(job.get("inputFingerprint") or "")):
         return ocr_page_anchor_pair(job, page_no, layout)
-    extracted = reader.pages[page_no - 1].extract_text() or ""
-    normalized, _ = normalize_for_match(extracted)
-    if len(normalized) >= 24:
-        midpoint = max(1, len(extracted) // 2)
-        return extracted[:midpoint], extracted[midpoint:]
+    # Existing PDF text may be stale or incorrectly ordered OCR. Page-boundary
+    # evidence must always come from the scan image itself.
     return ocr_page_anchor_pair(job, page_no, layout)
 
 
@@ -3369,7 +3374,7 @@ def strict_pair_committable(previous: dict, current: dict) -> bool:
     return "rawEnd" in previous and "rawStart" in current and int(previous["rawEnd"]) == int(current["rawStart"])
 
 
-def build_strict_page_manifest(
+def build_legacy_strict_page_manifest(
     job: dict,
     reader: PdfReader,
     layout: str,
@@ -3568,6 +3573,402 @@ def build_strict_page_manifest(
             metrics={"sourceOmitted": omitted, "sourceOmittedOcr": source_omitted_ocr},
         )
     return manifest
+
+
+def page_start_needles(anchor_text: str) -> list[str]:
+    """Return longest-first normalized prefixes from the physical page start."""
+    normalized, _ = normalize_for_match(anchor_text)
+    if len(normalized) < 6:
+        return []
+    sizes = [min(32, len(normalized)), 28, 24, 20, 18, 16, 14, 12, 10, 8, 6]
+    return list(dict.fromkeys(normalized[:size] for size in sizes if len(normalized) >= size))
+
+
+def unique_page_start_lock(
+    units: list[SourceUnit],
+    anchor_text: str,
+    active_unit: int,
+    cursor: int,
+    unresolved_since_lock: int = 0,
+) -> dict | None:
+    """Find one monotonic page-start anchor in a bounded forward source region."""
+    needles = page_start_needles(anchor_text)
+    if not needles or not units:
+        return None
+    first_unit = max(0, min(active_unit, len(units) - 1))
+    last_unit = min(len(units), first_unit + 4 + max(0, unresolved_since_lock))
+    forward_window = min(24000, 6000 + max(0, unresolved_since_lock) * 2500)
+    for needle in needles:
+        hits = []
+        for unit_index in range(first_unit, last_unit):
+            unit = units[unit_index]
+            source_norm, mapping = normalize_source_cached(unit.text)
+            low = max(0, cursor + 1) if unit_index == first_unit else 0
+            high = min(len(source_norm), low + forward_window)
+            if high - low < len(needle):
+                continue
+            position = source_norm.find(needle, low, high)
+            while position >= 0 and len(hits) < 2:
+                hits.append((unit_index, position, mapping[position]))
+                position = source_norm.find(needle, position + 1, high)
+            if len(hits) >= 2:
+                break
+        if len(hits) == 1:
+            unit_index, position, raw_position = hits[0]
+            return {
+                "unitIndex": unit_index,
+                "start": position,
+                "rawStart": raw_position,
+                "needle": needle,
+                "confidence": min(99, 76 + len(needle)),
+            }
+    return None
+
+
+def unique_page_start_lock_anywhere(units: list[SourceUnit], anchor_text: str) -> dict | None:
+    """Global one-off lookup for the user-selected trial page only."""
+    needles = page_start_needles(anchor_text)
+    for needle in needles:
+        hits = []
+        for unit_index, unit in enumerate(units):
+            source_norm, mapping = normalize_source_cached(unit.text)
+            position = source_norm.find(needle)
+            while position >= 0 and len(hits) < 2:
+                hits.append((unit_index, position, mapping[position]))
+                position = source_norm.find(needle, position + 1)
+            if len(hits) >= 2:
+                break
+        if len(hits) == 1:
+            unit_index, position, raw_position = hits[0]
+            return {
+                "unitIndex": unit_index, "start": position, "rawStart": raw_position,
+                "needle": needle, "confidence": min(99, 76 + len(needle)),
+            }
+    return None
+
+
+def page_tail_crosscheck(source_slice: str, end_anchor: str) -> dict:
+    """Check the current page tail without allowing it to change page bounds."""
+    source_norm, _ = normalize_for_match(source_slice)
+    anchor_norm, _ = normalize_for_match(end_anchor)
+    if not source_norm or len(anchor_norm) < 6:
+        return {"passed": False, "reason": "页尾 OCR 证据不足"}
+    tail_region_start = max(0, len(source_norm) - 360)
+    tail_region = source_norm[tail_region_start:]
+    sizes = [min(24, len(anchor_norm)), 20, 18, 16, 14, 12, 10, 8, 6]
+    for size in sizes:
+        if len(anchor_norm) < size:
+            continue
+        needle = anchor_norm[-size:]
+        positions = []
+        cursor = 0
+        while len(positions) < 2:
+            found = tail_region.find(needle, cursor)
+            if found < 0:
+                break
+            positions.append(found)
+            cursor = found + 1
+        if len(positions) == 1 and len(tail_region) - (positions[0] + size) <= 80:
+            return {"passed": True, "needle": needle, "distanceFromEnd": len(tail_region) - (positions[0] + size)}
+    return {"passed": False, "reason": "页尾 OCR 与次页页首划定的范围不一致"}
+
+
+CHAPTER_HEADING_PATTERN = re.compile(
+    r"^(?:第.{1,12}[卷章回篇]|卷[一二三四五六七八九十百千上下中0-9]+|[紀纪志傳传表書书].{0,12}第[一二三四五六七八九十百千0-9]+)"
+)
+
+
+def source_slice_has_internal_chapter_heading(source_slice: str) -> bool:
+    """Reject pages that visibly mix an old chapter tail with a new heading/body."""
+    lines = [re.sub(r"\s+", "", line) for line in source_slice.splitlines() if line.strip()]
+    for index, line in enumerate(lines):
+        if index == 0 or len(line) > 32:
+            continue
+        normalized, _ = normalize_for_match(line)
+        if normalized and CHAPTER_HEADING_PATTERN.match(normalized):
+            return True
+    return False
+
+
+def fill_non_authoritative_ocr(
+    job: dict,
+    reader: PdfReader,
+    manifest: list[dict],
+    layout: str,
+    status_job_id: str = "",
+) -> int:
+    """After authoritative alignment, turn every remaining nonblank page into OCR."""
+    candidates = [item for item in manifest if item.get("kind") != "body"]
+    if not candidates:
+        return 0
+    by_page = {int(item["page"]): item for item in candidates}
+    completed = 0
+    started = time.time()
+    worker_count = adaptive_ocr_workers(3)
+
+    def apply_text(page_no: int, text: str) -> None:
+        nonlocal completed
+        item = by_page[page_no]
+        decision = classify_page(job, reader, page_no, layout, text)
+        if decision.get("kind") == "blank":
+            item.update({
+                "kind": "blank", "status": "空白页", "text": "", "confidence": 100,
+                "textOrigin": "blank", "reason": decision.get("reason") or "空白页",
+            })
+        else:
+            item.update({
+                "kind": "ocr", "status": "整页 OCR", "text": text, "confidence": 70 if text.strip() else 0,
+                "sourceTitle": "本页 OCR", "sourceUrl": "", "textOrigin": "page-ocr",
+                "reason": "本页未进入权威文本层；整页 OCR 仅用于本页搜索，不参与任何权威页边界。",
+            })
+        completed += 1
+        if status_job_id and (completed == 1 or completed % 5 == 0 or completed == len(candidates)):
+            update_pipeline_stage(
+                status_job_id, "classify", "running", state="planning",
+                processed=completed, total=len(candidates), currentPage=page_no,
+                detail=f"非权威页整页 OCR {completed} / {len(candidates)}",
+                metrics=throughput_metrics(started, completed, len(candidates), workers=worker_count),
+                message=f"权威页已经固定，正在处理纯 OCR 页 {completed} / {len(candidates)}。",
+            )
+
+    pending_pages = []
+    for page_no in sorted(by_page):
+        cache_path = full_ocr_cache_path(job, page_no, layout)
+        if cache_path.exists():
+            apply_text(page_no, ocr_page_text(job, page_no, layout, anchors_only=False))
+            if status_job_id and read_full_status(status_job_id).get("pauseRequested"):
+                update_pipeline_stage(
+                    status_job_id, "classify", "paused", state="paused",
+                    processed=completed, total=len(candidates), detail="已完成 OCR 和缓存均已保留",
+                    pauseRequested=False,
+                )
+                raise TaskPaused()
+        else:
+            pending_pages.append(page_no)
+
+    if len(pending_pages) == 1:
+        page_no = pending_pages[0]
+        apply_text(page_no, ocr_page_text(job, page_no, layout, anchors_only=False))
+    elif pending_pages:
+        with concurrent.futures.ProcessPoolExecutor(max_workers=worker_count) as pool:
+            page_queue = iter(pending_pages)
+            pending: dict[concurrent.futures.Future, int] = {}
+
+            def fill_queue() -> None:
+                current_limit = adaptive_ocr_workers(worker_count)
+                while len(pending) < current_limit:
+                    try:
+                        page_no = next(page_queue)
+                    except StopIteration:
+                        break
+                    pending[pool.submit(full_page_ocr_worker, (str(job.get("id") or ""), page_no, layout))] = page_no
+
+            fill_queue()
+            while pending:
+                done, _ = concurrent.futures.wait(tuple(pending), return_when=concurrent.futures.FIRST_COMPLETED)
+                for future in done:
+                    expected_page = pending.pop(future)
+                    page_no, text, error = future.result()
+                    if error:
+                        raise RuntimeError(f"第 {expected_page} 页整页 OCR 失败：{error}")
+                    apply_text(page_no, text)
+                if status_job_id and read_full_status(status_job_id).get("pauseRequested"):
+                    for future in pending:
+                        future.cancel()
+                    update_pipeline_stage(
+                        status_job_id, "classify", "paused", state="paused",
+                        processed=completed, total=len(candidates), detail="已完成 OCR 和缓存均已保留",
+                        pauseRequested=False,
+                    )
+                    raise TaskPaused()
+                fill_queue()
+    if status_job_id:
+        update_pipeline_stage(
+            status_job_id, "classify", "done", state="planning",
+            processed=completed, total=len(candidates), detail=f"纯 OCR/空白页处理完成，共 {completed} 页",
+        )
+    return completed
+
+
+def build_strict_page_manifest(
+    job: dict,
+    reader: PdfReader,
+    layout: str,
+    status_job_id: str = "",
+    commit_callback: Callable[[int, dict], None] | None = None,
+) -> list[dict]:
+    """Build pages from current-page start to next-page start; OCR everything else."""
+    page_count = len(reader.pages)
+    units = load_source_units(job)
+    if not units:
+        raise ValueError("没有可用的校准文本，无法建立权威文字页。")
+    if status_job_id:
+        if not precompute_anchor_cache(status_job_id, page_count, layout, first_page=1):
+            raise TaskPaused()
+
+    locks: list[dict | None] = []
+    anchors: list[tuple[str, str]] = []
+    active_unit = 0
+    cursor = -1
+    unresolved_since_lock = 0
+    align_started = time.time()
+    for page_no in range(1, page_count + 1):
+        start_anchor, end_anchor = page_anchor_pair(job, reader, page_no, layout)
+        anchors.append((start_anchor, end_anchor))
+        lock = unique_page_start_lock(units, start_anchor, active_unit, cursor, unresolved_since_lock)
+        locks.append(lock)
+        if lock:
+            active_unit = int(lock["unitIndex"])
+            cursor = int(lock["start"])
+            unresolved_since_lock = 0
+        else:
+            unresolved_since_lock += 1
+        if status_job_id and (page_no == 1 or page_no % 25 == 0 or page_no == page_count):
+            update_pipeline_stage(
+                status_job_id, "align", "running", state="planning",
+                processed=page_no, total=page_count, currentPage=page_no,
+                detail=f"页首单调定位 {page_no} / {page_count}",
+                metrics=throughput_metrics(align_started, page_no, page_count),
+                message=f"正在按全书顺序锁定页首 {page_no} / {page_count}。",
+            )
+
+    manifest = []
+    for index in range(page_count):
+        page_no = index + 1
+        start_anchor, end_anchor = anchors[index]
+        current = locks[index]
+        following = locks[index + 1] if index + 1 < page_count else None
+        base = {
+            "page": page_no, "kind": "unresolved", "status": "未锁定", "text": "", "confidence": 0,
+            "sourceTitle": "", "sourceUrl": "", "startAnchor": start_anchor, "endAnchor": end_anchor,
+        }
+        if index == page_count - 1:
+            base["reason"] = "最后一页没有次页页首，按规则直接进入整页 OCR。"
+            manifest.append(base)
+            continue
+        if not current or not following:
+            base["reason"] = "本页页首或次页页首未能在校准文本的后续范围中唯一锁定。"
+            manifest.append(base)
+            continue
+        current_unit_index = int(current["unitIndex"])
+        following_unit_index = int(following["unitIndex"])
+        unit = units[current_unit_index]
+        start = int(current["start"])
+        raw_start = int(current["rawStart"])
+        if current_unit_index == following_unit_index:
+            end = int(following["start"])
+            raw_end = int(following["rawStart"])
+        elif following_unit_index == current_unit_index + 1 and int(following["start"]) == 0:
+            # A clean chapter break between physical pages: the current page
+            # contains only the remainder of the old unit.
+            end = len(normalize_source_cached(unit.text)[0])
+            raw_end = len(unit.text)
+        else:
+            base["status"] = "章节混排"
+            base["reason"] = "次页从新章节内部开始，说明本页混入章节标题或新章正文，改用本页 OCR。"
+            manifest.append(base)
+            continue
+        if end <= start or raw_end <= raw_start:
+            base["status"] = "顺序冲突"
+            base["reason"] = "相邻页首页在校准文本中的顺序无效，改用本页 OCR。"
+            manifest.append(base)
+            continue
+        page_text = unit.text[raw_start:raw_end].strip()
+        if not page_text or source_slice_has_internal_chapter_heading(page_text):
+            base["status"] = "章节混排"
+            base["reason"] = "页内出现新章节标题或没有可写权威文字，改用本页 OCR。"
+            manifest.append(base)
+            continue
+        tail = page_tail_crosscheck(page_text, end_anchor)
+        row = {
+            **base,
+            "kind": "body", "status": "页首与次页页首锁边", "text": page_text,
+            "confidence": min(int(current["confidence"]), int(following["confidence"])),
+            "sourceTitle": unit.title, "sourceUrl": unit.url or unit.title, "sourceKind": unit.kind,
+            "start": start, "end": end, "rawStart": raw_start, "rawEnd": raw_end,
+            "startNeedle": current["needle"], "nextStartNeedle": following["needle"],
+            "tailCrosscheck": tail,
+            "reason": "本页起点由本页页首确定，终点由次页页首反推；本页页尾 OCR 仅作非阻断交叉验证。",
+            "adjacentVerified": True,
+        }
+        manifest.append(row)
+        if commit_callback:
+            commit_callback(page_no, dict(row))
+
+    fill_non_authoritative_ocr(job, reader, manifest, layout, status_job_id)
+    if status_job_id:
+        body_count = sum(1 for item in manifest if item.get("kind") == "body")
+        ocr_count = sum(1 for item in manifest if item.get("kind") == "ocr")
+        blank_count = sum(1 for item in manifest if item.get("kind") == "blank")
+        update_pipeline_stage(
+            status_job_id, "align", "done", state="planning",
+            processed=page_count, total=page_count,
+            detail=f"权威页 {body_count}，OCR 页 {ocr_count}，空白页 {blank_count}",
+            metrics={"authoritative": body_count, "ocr": ocr_count, "blank": blank_count},
+        )
+    return manifest
+
+
+def resolve_trial_page_by_next_start(
+    job: dict, reader: PdfReader, page_no: int, layout: str
+) -> dict:
+    """Resolve one preview page with the same current-start/next-start contract."""
+    page_count = len(reader.pages)
+    if page_no >= page_count:
+        text = ocr_page_text(job, page_no, layout, anchors_only=False)
+        return {
+            "page": page_no, "kind": "ocr", "status": "整页 OCR", "text": text,
+            "confidence": 70 if text.strip() else 0, "sourceTitle": "本页 OCR",
+            "reason": "最后一页按规则直接使用整页 OCR。",
+        }
+    units = load_source_units(job)
+    start_anchor, end_anchor = page_anchor_pair(job, reader, page_no, layout)
+    next_start_anchor, _ = page_anchor_pair(job, reader, page_no + 1, layout)
+    current = unique_page_start_lock_anywhere(units, start_anchor)
+    following = None
+    if current:
+        following = unique_page_start_lock(
+            units, next_start_anchor, int(current["unitIndex"]), int(current["start"]), 0
+        )
+    if not current or not following:
+        return {
+            "page": page_no, "kind": "unresolved", "status": "未锁定", "text": "", "confidence": 0,
+            "startAnchor": start_anchor, "endAnchor": end_anchor, "nextStartAnchor": next_start_anchor,
+            "reason": "本页页首与次页页首没有在同一校准文本单元中唯一、顺序锁定。",
+        }
+    current_unit_index = int(current["unitIndex"])
+    following_unit_index = int(following["unitIndex"])
+    unit = units[current_unit_index]
+    raw_start = int(current["rawStart"])
+    start = int(current["start"])
+    if current_unit_index == following_unit_index:
+        raw_end = int(following["rawStart"])
+        end = int(following["start"])
+    elif following_unit_index == current_unit_index + 1 and int(following["start"]) == 0:
+        raw_end = len(unit.text)
+        end = len(normalize_source_cached(unit.text)[0])
+    else:
+        return {
+            "page": page_no, "kind": "unresolved", "status": "章节混排", "text": "", "confidence": 0,
+            "startAnchor": start_anchor, "endAnchor": end_anchor, "nextStartAnchor": next_start_anchor,
+            "reason": "次页从新章节内部开始，本页应使用整页 OCR。",
+        }
+    text = unit.text[raw_start:raw_end].strip() if raw_end > raw_start else ""
+    if not text or source_slice_has_internal_chapter_heading(text):
+        return {
+            "page": page_no, "kind": "unresolved", "status": "章节混排", "text": "", "confidence": 0,
+            "startAnchor": start_anchor, "endAnchor": end_anchor, "nextStartAnchor": next_start_anchor,
+            "reason": "本页跨章节或没有可写权威文本，应在整本任务中使用整页 OCR。",
+        }
+    return {
+        "page": page_no, "kind": "body", "status": "页首与次页页首锁边", "text": text,
+        "confidence": min(int(current["confidence"]), int(following["confidence"])),
+        "sourceTitle": unit.title, "sourceUrl": unit.url or unit.title, "sourceKind": unit.kind,
+        "start": start, "end": end, "rawStart": raw_start, "rawEnd": raw_end,
+        "startAnchor": start_anchor, "endAnchor": end_anchor, "nextStartAnchor": next_start_anchor,
+        "tailCrosscheck": page_tail_crosscheck(text, end_anchor),
+        "reason": "本页页首确定起点，次页页首确定终点；页尾 OCR 仅作交叉验证。",
+    }
 
 
 def unresolved_runs(manifest: list[dict]) -> list[tuple[int, int]]:
@@ -4144,10 +4545,10 @@ def ensure_pipeline(status: dict) -> dict:
             state="blocked" if unresolved else "done",
             processed=total,
             total=total,
-            detail=f"已锁定 {locked} 页，待核对 {unresolved} 页" if unresolved else f"已锁定 {locked} 页",
+            detail=f"权威页 {locked} 页，仍有 {unresolved} 页待处理" if unresolved else f"权威页 {locked} 页",
         )
-        omitted = int(alignment.get("sourceOmitted") or 0)
-        pipeline[3].update(state="done", processed=omitted, total=omitted, detail=f"来源未收录 {omitted} 页")
+        ocr_pages = int(alignment.get("ocr") or 0)
+        pipeline[3].update(state="done", processed=ocr_pages, total=ocr_pages, detail=f"纯 OCR 页 {ocr_pages} 页")
         if status.get("state") == "done":
             for stage in pipeline[4:]:
                 stage.update(state="done")
@@ -4279,7 +4680,7 @@ def cleanup_old_cache(days: int = 7) -> dict:
 def manifest_summary(manifest: list[dict] | None, page_count: int) -> dict:
     if not manifest:
         return {"matched": 0, "constrained": 0, "ocr": 0, "blank": 0, "sourceOmitted": 0, "sourceOmittedOcr": 0, "unresolved": page_count, "estimated": 0, "warnings": 0, "boundaryReview": 0, "reviewRequired": page_count, "averageConfidence": 0}
-    matched_statuses = {"双头锁边", "跨章节双头锁边", "全文 OCR 边界校准"}
+    matched_statuses = {"页首与次页页首锁边", "双头锁边", "跨章节双头锁边", "全文 OCR 边界校准"}
     constrained_statuses = {
         "相邻双锁约束", "章节边界约束", "多页缺口双锚恢复",
         "章节过渡前章约束", "章节过渡后章约束", "页首锁边", "页尾锁边",
@@ -4310,7 +4711,7 @@ def manifest_summary(manifest: list[dict] | None, page_count: int) -> dict:
         "estimated": estimated,
         "warnings": warnings,
         "boundaryReview": boundary_review,
-        "reviewRequired": unresolved + estimated + warnings + ocr_pages + boundary_review,
+        "reviewRequired": unresolved + estimated + boundary_review,
         "averageConfidence": average,
     }
 
@@ -4739,16 +5140,14 @@ def build_full_pdf(job_id: str, layout: str, stop_after: int | None = None) -> d
         except (OSError, json.JSONDecodeError):
             pass
     if manifest is None:
-        manifest = (
-            build_strict_page_manifest(
-                job,
-                reader,
-                selected_layout,
-                status_job_id=job_id,
-                commit_callback=commit_stream_page,
-            )
-            if STRICT_MANIFEST_ENABLED
-            else build_fast_authoritative_manifest(job, reader, selected_layout, status_job_id=job_id)
+        # There is only one production alignment path. Estimated/fast manifests
+        # are intentionally never used for authoritative page text.
+        manifest = build_strict_page_manifest(
+            job,
+            reader,
+            selected_layout,
+            status_job_id=job_id,
+            commit_callback=commit_stream_page,
         )
     for row in manifest:
         if row.get("kind") != "body" or not row.get("text"):
@@ -4810,14 +5209,9 @@ def build_full_pdf(job_id: str, layout: str, stop_after: int | None = None) -> d
         blockers.append(f"{alignment['unresolved']} 页未锁定")
     if alignment["estimated"] and not ALLOW_ESTIMATED_OUTPUT:
         blockers.append(f"{alignment['estimated']} 页仍是估算范围")
-    if alignment["ocr"] and not ALLOW_OCR_OUTPUT:
-        blockers.append(f"{alignment['ocr']} 页只有 OCR 文字")
-    if alignment["warnings"] and not ALLOW_UNRESOLVED_OUTPUT:
-        blockers.append(f"{alignment['warnings']} 处连续性警告")
     if alignment["boundaryReview"] and not ALLOW_UNRESOLVED_OUTPUT:
         blockers.append(f"{alignment['boundaryReview']} 页旧式页界结果待复核")
     if blockers:
-        issue_report = write_alignment_issues(job_id, manifest)
         if streamed_pages:
             update_pipeline_stage(
                 job_id,
@@ -4835,10 +5229,10 @@ def build_full_pdf(job_id: str, layout: str, stop_after: int | None = None) -> d
             activeStage="align",
             processed=page_count,
             total=page_count,
-            message=f"严格核对已完成，但还有{'、'.join(blockers)}。已停止发布 PDF，并生成待核对页清单。",
+            message=f"处理未完成：{'、'.join(blockers)}。非权威页应自动转为整页 OCR，请重试任务。",
             alignment=alignment,
             validation={},
-            outputs=[make_output_link(job_id, issue_report, "待核对页清单", "CSV")],
+            outputs=[],
         )
     if alignment["unresolved"]:
         unresolved_pages = [str(item.get("page")) for item in manifest if item.get("kind") == "unresolved"]
@@ -4997,22 +5391,12 @@ def make_trial(job_id: str, page_no: int, layout: str) -> dict:
     blocks = detect_horizontal_block(image) if selected_layout == "horizontal" else detect_vertical_blocks(image, selected_layout)
 
     reader = PdfReader(str(pdf_path), strict=False)
-    resolved = resolve_page(job, reader, page_no, selected_layout, allow_discovery=True)
-    if page_no > 1 and resolved.get("kind") == "body":
-        previous = resolve_page(job, reader, page_no - 1, selected_layout, allow_discovery=False)
-        pair = [previous, resolved]
-        enforce_adjacent_page_boundaries(pair)
-        resolved = pair[1]
-    if page_no < len(reader.pages) and resolved.get("kind") == "body":
-        following = resolve_page(job, reader, page_no + 1, selected_layout, allow_discovery=False)
-        pair = [resolved, following]
-        enforce_adjacent_page_boundaries(pair)
-        resolved = pair[0]
+    resolved = resolve_trial_page_by_next_start(job, reader, page_no, selected_layout)
     if resolved.get("kind") == "unresolved":
         start_sample = normalize_for_match(str(resolved.get("startAnchor") or ""))[0][:18]
         end_sample = normalize_for_match(str(resolved.get("endAnchor") or ""))[0][-18:]
         detail = " / ".join(value for value in (start_sample, end_sample) if value)
-        raise ValueError(f"OCR 已读到这一页的两端，但还没有在同一可靠正文中双锁成功{f'：{detail}' if detail else ''}。系统没有强行放入错误文字。")
+        raise ValueError(f"本页页首与次页页首尚未在校准文本中唯一、顺序锁定{f'：{detail}' if detail else ''}。整本任务会把这一页改为纯 OCR。")
     if resolved.get("kind") == "blank":
         raise ValueError("这一页被判断为空白或纯图像页，不适合作为正文校准页。")
 

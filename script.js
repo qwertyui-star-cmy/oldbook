@@ -373,7 +373,7 @@
       waiting: "等待边界确认",
       running: "运行中",
       done: "完成",
-      blocked: "待核对",
+      blocked: "待处理",
       paused: "已暂停",
       error: "异常"
     };
@@ -460,16 +460,16 @@
       `<li><span>${escapeHtml(item.reason)}</span><strong>${escapeHtml(item.count)} 页</strong></li>`
     ).join("");
     const nextAction = backendActive
-      ? "后台正在继续严格核对，无需重复点击。"
-      : `后台当前未运行。点击“继续严格核对 ${unresolved} 页”会复用缓存继续，不会重头 OCR。`;
+      ? "后台正在把剩余页面转换为本页整页 OCR。"
+      : `仍有 ${unresolved} 页没有完成自动 OCR 转换；重新开始会复用已有缓存。`;
     diagnostics.hidden = false;
     diagnostics.innerHTML = `
       <div class="diagnostics-head">
         <div>
-          <strong>严格发布门禁：尚未通过</strong>
+          <strong>非权威页 OCR 尚未完成</strong>
           <p>${escapeHtml(nextAction)}</p>
         </div>
-        <span class="diagnostics-count">${escapeHtml(unresolved)} 页待核对</span>
+        <span class="diagnostics-count">${escapeHtml(unresolved)} 页待处理</span>
       </div>
       ${qualityRegressionBlocked ? '<p class="diagnostics-warning">质量回归已拦截：新结果没有覆盖已保存清单。</p>' : ''}
       ${data.current === false ? '<p class="diagnostics-warning">诊断清单正在刷新，以顶部实时数量为准。</p>' : ''}
@@ -508,7 +508,7 @@
       : (manifestReused ? "已复用核对清单" : "");
     const stateLabel = {
       done: "已完成",
-      error: needsReview ? "待核对" : "失败",
+      error: needsReview ? "待处理" : "失败",
       paused: "已暂停",
       reviewing: "生成预览",
       planning: "后台处理中",
@@ -559,17 +559,17 @@
       : "--";
     progressTitle.textContent = {
       done: "整本已完成",
-      error: needsReview ? "尚待核对" : "整本未生成",
+      error: needsReview ? "部分页面尚未处理" : "整本未生成",
       paused: "已暂停",
       reviewing: "正在生成核对预览",
       planning: "后台运行中",
       queued: "准备开始"
     }[payload.state] || (backendActive ? "后台运行中" : "整本处理中");
     const alignmentText = alignment
-      ? `严格锁定 ${(alignment.matched || 0) + (alignment.constrained || 0)} 页，来源未收录 ${alignment.sourceOmitted || 0} 页（本页 OCR ${alignment.sourceOmittedOcr || 0} 页），估算 ${alignment.estimated || 0} 页，待核对 ${alignment.reviewRequired || alignment.unresolved || 0} 页。`
+      ? `权威文本页 ${(alignment.matched || 0) + (alignment.constrained || 0)} 页，纯 OCR 页 ${alignment.ocr || 0} 页，空白页 ${alignment.blank || 0} 页，未完成 ${alignment.unresolved || 0} 页。`
       : "";
     const alignmentPendingText = alignmentStage?.state === "running"
-      ? "严格锁定、来源未收录和待核对数量将在全书边界恢复后统一公布。"
+      ? "权威文本页、纯 OCR 页和空白页数量将在逐页处理后公布。"
       : "";
     progressDetail.textContent = backendActive
       ? `${rateLabel} · ${etaLabel}`
@@ -578,10 +578,8 @@
     workMotion.classList.toggle("is-stalled", Boolean(payload.stalled));
     renderDiagnostics({ ...payload, alignment }, backendActive);
     renderPipeline(payload.pipeline);
-    const hasReviewDraft = Array.isArray(payload.outputs)
-      && payload.outputs.some(item => String(item.name || "").includes("核对预览"));
-    reviewDraft.hidden = !needsReview || backendActive || hasReviewDraft;
-    reviewDraft.disabled = backendActive || !currentJob;
+    reviewDraft.hidden = true;
+    reviewDraft.disabled = true;
     if (pipelineDetails && (payload.state === "error" || needsReview || payload.stalled)) {
       pipelineDetails.open = true;
     }
@@ -608,7 +606,7 @@
     outputState.textContent = payload.reusedOutput
       ? "已复用现有整本"
       : (needsReview && !backendActive
-      ? `待核对 ${reviewCount} 页`
+      ? `待处理 ${reviewCount} 页`
       : (total ? `${stateLabel} · ${processed} / ${total}` : (payload.message || "整本处理中")));
     document.title = total && !["done", "error", "paused"].includes(payload.state)
       ? `${percent}% ${displayedProcessed}/${displayedTotal} · ${APP_TITLE}`
@@ -625,11 +623,11 @@
     activateProgress.hidden = backendActive || payload.state === "done";
     activateProgress.disabled = backendActive || !currentJob;
     activateProgress.textContent = needsReview
-      ? `继续严格核对 ${reviewCount} 页`
+      ? `继续处理 ${reviewCount} 页`
       : (payload.state === "paused" ? "继续运行" : "开始运行");
     runFull.disabled = backendActive || !currentJob || outputMatchesLayout;
     runFull.textContent = needsReview
-      ? `继续严格核对 ${reviewCount} 页`
+      ? `继续处理 ${reviewCount} 页`
       : (outputMatchesLayout ? "整本已是最新" : (payload.state === "paused" ? "继续运行" : (payload.state === "done" ? "按当前版式生成" : "生成整本")));
   }
 
