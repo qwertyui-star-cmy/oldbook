@@ -1,0 +1,10 @@
+Pillow==12.3.0
+onnxruntime==1.29.0
+opencc-python-reimplemented==0.1.7
+opencv-python==5.0.0.93
+pikepdf==10.2.0
+pypdf==6.10.0
+pypdfium2==5.12.1
+pypinyin==0.55.0
+rapidocr==3.9.2
+reportlab==4.4.9

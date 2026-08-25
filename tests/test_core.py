@@ -14,6 +14,7 @@ from urllib.request import Request, urlopen
 
 from PIL import Image
 from pypdf import PdfReader, PdfWriter
+from pypdf.generic import ContentStream
 
 import server
 import text_layer_engine as engine
@@ -23,6 +24,47 @@ class EngineTests(unittest.TestCase):
     def test_job_id_cannot_escape_cache_root(self):
         with self.assertRaises(ValueError):
             engine.job_paths("../../valuable")
+
+    def test_identical_inputs_reuse_existing_job(self):
+        with tempfile.TemporaryDirectory() as temporary, patch.object(engine, "JOBS_DIR", Path(temporary)):
+            pdf_packet = io.BytesIO()
+            from reportlab.pdfgen import canvas
+
+            pdf_canvas = canvas.Canvas(pdf_packet, pagesize=(200, 300))
+            pdf_canvas.showPage()
+            pdf_canvas.save()
+            pdf_bytes = pdf_packet.getvalue()
+
+            def upload(name: str, payload: bytes):
+                return SimpleNamespace(filename=name, file=io.BytesIO(payload))
+
+            first = engine.create_job(
+                upload("same.pdf", pdf_bytes), upload("same.txt", "权威正文".encode("utf-8")), "", "vertical-single"
+            )
+            second = engine.create_job(
+                upload("same.pdf", pdf_bytes), upload("same.txt", "权威正文".encode("utf-8")), "", "vertical-single"
+            )
+
+            self.assertEqual(first["jobId"], second["jobId"])
+            self.assertTrue(second["reused"])
+            self.assertEqual(len(list(Path(temporary).glob("*/job.json"))), 1)
+
+    def test_completed_output_is_reused_only_for_current_engine_and_layout(self):
+        with tempfile.TemporaryDirectory() as temporary, patch.object(engine, "JOBS_DIR", Path(temporary)):
+            job_id = "1122334455667788"
+            paths = engine.job_paths(job_id)
+            paths.root.mkdir(parents=True)
+            engine.atomic_write_json(paths.meta, {"id": job_id, "layout": "vertical-single"})
+            (paths.root / "text-positioned-full.pdf").write_bytes(b"pdf")
+            engine.write_full_status(
+                job_id,
+                state="done",
+                engineVersion=engine.LAYOUT_ENGINE_VERSION,
+                outputLayout="vertical-single",
+            )
+
+            self.assertTrue(engine.completed_output_is_current(job_id, "vertical-single"))
+            self.assertFalse(engine.completed_output_is_current(job_id, "horizontal"))
 
     def test_horizontal_layer_keeps_all_text(self):
         packet = io.BytesIO()
@@ -37,37 +79,120 @@ class EngineTests(unittest.TestCase):
         extracted = PdfReader(packet, strict=False).pages[0].extract_text() or ""
         self.assertEqual(engine.normalize_for_match(extracted)[0], engine.normalize_for_match(expected)[0])
 
-    def test_common_glyph_variants_follow_the_scan(self):
+    def test_common_glyph_variants_normalize_for_matching_only(self):
         self.assertEqual(engine.normalize_for_match("徳宗再𭣣長安")[0], engine.normalize_for_match("德宗再收長安")[0])
-        adjusted, note = engine.adapt_text_to_scan_script("徳宗再𭣣長安", "德宗自復京闕")
-        self.assertEqual(adjusted, "德宗再收長安")
-        self.assertTrue(note)
-
-    def test_search_aliases_are_contiguous_and_bilingual(self):
-        packet = io.BytesIO()
-        from reportlab.pdfgen import canvas
-
-        pdf_canvas = canvas.Canvas(packet, pagesize=(595, 842), pageCompression=1)
-        engine.draw_search_aliases(pdf_canvas, "德宗自復，京闕國史")
-        pdf_canvas.showPage()
-        pdf_canvas.save()
-        packet.seek(0)
-        extracted = PdfReader(packet, strict=False).pages[0].extract_text() or ""
-        self.assertIn("德宗自復京闕國史", extracted)
-        self.assertIn("德宗自复京阙国史", extracted)
-        self.assertNotIn("，", extracted)
-
-    def test_local_search_fragments_cover_cross_column_phrases(self):
-        text = "天地玄黄宇宙洪荒日月盈昃辰宿列张寒来暑往秋收冬藏" * 4
-        fragments = [fragment for alias_index, _, fragment in engine.search_alias_fragments(text) if alias_index == 0]
-        for start in range(0, len(text) - 24 + 1):
-            self.assertTrue(any(text[start:start + 24] in fragment for fragment in fragments))
+        self.assertEqual(engine.normalize_for_match("漢爲國")[0], engine.normalize_for_match("汉为国")[0])
 
     def test_ocr_worker_count_adapts_but_stays_bounded(self):
         with patch.dict("os.environ", {"TEXT_LAYER_OCR_WORKERS": "7"}):
             self.assertEqual(engine.adaptive_ocr_workers(), 7)
         with patch.dict("os.environ", {"TEXT_LAYER_OCR_WORKERS": "99"}):
             self.assertEqual(engine.adaptive_ocr_workers(), 8)
+
+    def test_grouped_ocr_uses_grid_without_mixing_crop_coordinates(self):
+        seen_sizes = []
+
+        def fake_ocr(image):
+            seen_sizes.append(image.size)
+            return SimpleNamespace(
+                boxes=[
+                    [[10, 10], [30, 10], [30, 30], [10, 30]],
+                    [[146, 10], [166, 10], [166, 30], [146, 30]],
+                    [[10, 246], [30, 246], [30, 266], [10, 266]],
+                    [[146, 246], [166, 246], [166, 266], [146, 266]],
+                ],
+                txts=["甲", "乙", "丙", "丁"],
+                scores=[0.99, 0.99, 0.99, 0.99],
+            )
+
+        crops = [Image.new("RGB", (100, 200), "white") for _ in range(4)]
+        with patch.object(engine, "get_ocr_engine", return_value=fake_ocr):
+            result = engine.ocr_grouped_images(crops, "vertical-single")
+
+        self.assertEqual(result, ["甲", "乙", "丙", "丁"])
+        self.assertEqual(seen_sizes, [(236, 436)])
+
+    def test_pdfium_document_is_opened_once_per_worker(self):
+        opened = []
+
+        class FakeBitmap:
+            def to_pil(self):
+                return Image.new("RGB", (20, 30), "white")
+
+            def close(self):
+                pass
+
+        class FakePage:
+            def render(self, scale):
+                self.scale = scale
+                return FakeBitmap()
+
+            def close(self):
+                pass
+
+        class FakeDocument:
+            def __init__(self, path):
+                opened.append(path)
+
+            def __getitem__(self, index):
+                return FakePage()
+
+            def close(self):
+                pass
+
+        with tempfile.TemporaryDirectory() as temporary:
+            pdf = Path(temporary) / "book.pdf"
+            pdf.write_bytes(b"cache identity only")
+            engine.close_pdfium_documents()
+            with patch.object(engine, "pdfium", SimpleNamespace(PdfDocument=FakeDocument)):
+                first = engine.render_page_images_persistent(pdf, [1, 2], dpi=144)
+                second = engine.render_page_images_persistent(pdf, [3], dpi=144)
+            engine.close_pdfium_documents()
+
+        self.assertEqual(len(opened), 1)
+        self.assertEqual([image.size for image in [*first, *second]], [(20, 30)] * 3)
+
+    def test_anchor_cache_is_scoped_to_layout_and_input(self):
+        with tempfile.TemporaryDirectory() as temporary, patch.object(engine, "JOBS_DIR", Path(temporary)):
+            job_id = "1234567890abcdef"
+            root = engine.job_paths(job_id).root
+            root.mkdir(parents=True)
+            engine.atomic_write_json(root / f"page-0001-ocr-anchors-v{engine.ANCHOR_CACHE_VERSION}.json", {
+                "complete": True,
+                "start": "天地",
+                "end": "玄黄",
+                "layout": "vertical-single",
+                "inputFingerprint": "book-a",
+            })
+
+            self.assertTrue(engine.anchor_cache_ready(job_id, 1, "vertical-single", "book-a"))
+            self.assertFalse(engine.anchor_cache_ready(job_id, 1, "horizontal", "book-a"))
+            self.assertFalse(engine.anchor_cache_ready(job_id, 1, "vertical-single", "book-b"))
+
+    def test_stream_commit_requires_exact_reverse_confirmed_boundary(self):
+        previous = {
+            "kind": "body", "status": "双头锁边", "sourceUrl": "chapter-1",
+            "rawStart": 0, "rawEnd": 12,
+        }
+        current = {
+            "kind": "body", "status": "双头锁边", "sourceUrl": "chapter-1",
+            "rawStart": 12, "rawEnd": 25,
+        }
+
+        self.assertTrue(engine.strict_pair_committable(previous, current))
+        self.assertFalse(engine.strict_pair_committable(previous, {**current, "rawStart": 13}))
+        self.assertFalse(engine.strict_pair_committable(previous, {**current, "sourceUrl": "chapter-2"}))
+        self.assertFalse(engine.strict_pair_committable({**previous, "status": "连续区间恢复"}, current))
+
+    def test_corrupt_page_layer_cache_is_rebuilt_instead_of_trusted(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            page = root / "page-00001.pdf"
+            signature = root / "page-00001.sha256"
+            page.write_bytes(b"not a pdf")
+            signature.write_text("expected", encoding="ascii")
+
+            self.assertFalse(engine.page_layer_cache_valid(page, signature, "expected", "正文"))
 
     def test_stable_vertical_blocks_do_not_require_page_ocr(self):
         blocks, image_size = engine.stable_vertical_blocks(595, 842, "vertical-single")
@@ -98,6 +223,61 @@ class EngineTests(unittest.TestCase):
             )
             self.assertEqual(result["pages"], 1)
             self.assertGreater(result["extractedChars"], 0)
+            self.assertEqual(len(result["continuousTextHash"]), 64)
+
+    def test_production_overlay_contains_one_exact_authoritative_stream(self):
+        packet = io.BytesIO()
+        from reportlab.pdfgen import canvas
+
+        source_canvas = canvas.Canvas(packet, pagesize=(595, 842), pageCompression=1)
+        source_canvas.showPage()
+        source_canvas.save()
+        packet.seek(0)
+        page = PdfReader(packet, strict=False).pages[0]
+        expected = "侯。追尊宣王爲宣皇帝，禮樂制度皆如魏舊。"
+
+        overlay = engine.overlay_for_page(page, expected, [], "vertical-single", (595, 842))
+        extracted = overlay.extract_text() or ""
+
+        self.assertEqual(engine.canonical_output_text(extracted), engine.canonical_output_text(expected))
+        self.assertNotIn("为宣皇帝", extracted)
+
+    def test_word_style_frame_reduces_font_instead_of_overflowing(self):
+        usable_w = 595 - 2 * (3 * 72 / 2.54)
+        usable_h = 842 - 2 * (3 * 72 / 2.54)
+
+        normal_size = engine.word_frame_font_size(400, usable_w, usable_h)
+        reduced_size = engine.word_frame_font_size(4000, usable_w, usable_h)
+
+        self.assertEqual(normal_size, 12.0)
+        self.assertLess(reduced_size, 12.0)
+        capacity = int(usable_w / reduced_size) * int(usable_h / reduced_size)
+        self.assertGreaterEqual(capacity, 4000)
+
+    def test_remove_text_keeps_scanned_image_operations(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            image_path = root / "scan.png"
+            pdf_path = root / "mixed.pdf"
+            Image.new("RGB", (40, 40), "black").save(image_path)
+            from reportlab.pdfgen import canvas
+
+            source_canvas = canvas.Canvas(str(pdf_path), pagesize=(200, 200), pageCompression=1)
+            source_canvas.drawImage(str(image_path), 20, 20, 160, 160)
+            source_canvas.drawString(30, 180, "old OCR")
+            source_canvas.showPage()
+            source_canvas.save()
+
+            reader = PdfReader(str(pdf_path), strict=False)
+            writer = PdfWriter()
+            writer.add_page(reader.pages[0])
+            page = writer.pages[0]
+            engine.remove_text(page, writer)
+            operators = [operator for _, operator in ContentStream(page.get_contents(), writer).operations]
+
+            self.assertIn(b"Do", operators)
+            self.assertNotIn(b"Tj", operators)
+            self.assertNotIn(b"TJ", operators)
 
     def test_status_file_remains_valid_under_concurrent_updates(self):
         with tempfile.TemporaryDirectory() as temporary, patch.object(engine, "JOBS_DIR", Path(temporary)):
@@ -133,6 +313,29 @@ class EngineTests(unittest.TestCase):
             self.assertEqual(stage["detail"], "2 路并行")
             self.assertEqual(status["processed"], 8)
             self.assertEqual(status["activeStage"], "ocr")
+
+    def test_pipeline_stage_restart_resets_elapsed_time(self):
+        with tempfile.TemporaryDirectory() as temporary, patch.object(engine, "JOBS_DIR", Path(temporary)):
+            job_id = "abcdef1234567890"
+            engine.job_paths(job_id).root.mkdir(parents=True)
+            engine.write_full_status(job_id, state="planning", pipeline=engine.new_pipeline())
+            with patch.object(engine.time, "time", return_value=1000.0):
+                engine.update_pipeline_stage(job_id, "align", "running", state="planning", processed=1, total=10)
+            with patch.object(engine.time, "time", return_value=1010.0):
+                engine.update_pipeline_stage(job_id, "align", "blocked", state="planning", processed=10, total=10)
+            with patch.object(engine.time, "time", return_value=2000.0):
+                status = engine.update_pipeline_stage(job_id, "align", "running", state="planning", processed=0, total=10)
+
+            stage = next(item for item in status["pipeline"] if item["id"] == "align")
+            self.assertEqual(stage["startedAt"], 2000.0)
+            self.assertNotIn("endedAt", stage)
+            self.assertEqual(stage["elapsedSeconds"], 0)
+            with patch.object(engine.time, "time", return_value=3000.0):
+                status = engine.update_pipeline_stage(job_id, "ocr", "done", state="planning", processed=10, total=10)
+            stage = next(item for item in status["pipeline"] if item["id"] == "ocr")
+            self.assertEqual(stage["startedAt"], 3000.0)
+            self.assertEqual(stage["endedAt"], 3000.0)
+            self.assertEqual(stage["elapsedSeconds"], 0)
 
     def test_first_page_is_not_automatically_front_matter(self):
         page = SimpleNamespace(extract_text=lambda: "天地玄黄宇宙洪荒日月盈昃辰宿列张寒来暑往秋收冬藏闰余成岁律吕调阳云腾致雨露结为霜")
@@ -189,6 +392,66 @@ class EngineTests(unittest.TestCase):
             units = engine.epub_spine_units(epub)
             self.assertEqual([unit.text for unit in units], ["一\n第一章", "二\n第二章", "十\n第十章"])
 
+    def test_epub_non_spine_navigation_is_available_before_body(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            epub = Path(temporary) / "book.epub"
+            with zipfile.ZipFile(epub, "w") as archive:
+                archive.writestr("META-INF/container.xml", """<?xml version="1.0"?>
+                    <container xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+                      <rootfiles><rootfile full-path="OPS/book.opf"/></rootfiles>
+                    </container>""")
+                archive.writestr("OPS/book.opf", """<package xmlns="http://www.idpf.org/2007/opf">
+                    <manifest>
+                      <item id="nav" href="nav.xhtml" properties="nav"/>
+                      <item id="body" href="body.xhtml"/>
+                    </manifest>
+                    <spine><itemref idref="body"/></spine>
+                    </package>""")
+                archive.writestr("OPS/nav.xhtml", "<html><title>目录</title><body>帝纪第一帝纪第二</body></html>")
+                archive.writestr("OPS/body.xhtml", "<html><title>帝纪第一</title><body>正文天地玄黄</body></html>")
+
+            units = engine.epub_spine_units(epub)
+
+            self.assertEqual([unit.title for unit in units], ["目录", "帝纪第一"])
+            self.assertIn("帝纪第一帝纪第二", units[0].text)
+
+    def test_special_page_matches_authority_before_ocr_classification(self):
+        authority_match = {
+            "start": 0, "end": 20, "rawStart": 0, "rawEnd": 20,
+            "text": "目录帝纪第一帝纪第二", "confidence": 95,
+            "sourceTitle": "目录", "sourceUrl": "toc", "sourceKind": "epub",
+            "authorityRank": 45,
+        }
+        reader = SimpleNamespace(pages=[SimpleNamespace()])
+        with (
+            patch.object(engine, "FULL_OCR_FALLBACK_ENABLED", True),
+            patch.object(engine, "ocr_page_text", return_value="目录\n帝纪第一\n帝纪第二"),
+            patch.object(engine, "classify_page", return_value={"kind": "ocr", "reason": "短条目密集页面"}),
+            patch.object(engine, "page_anchor_pair", return_value=("目录帝纪第一", "帝纪第二")),
+            patch.object(engine, "match_page_source", return_value=authority_match),
+        ):
+            result = engine.resolve_page({}, reader, 1, "vertical-single", candidate_units=[])
+
+        self.assertEqual(result["kind"], "body")
+        self.assertEqual(result["text"], "目录帝纪第一帝纪第二")
+
+    def test_unmatched_special_page_does_not_publish_ocr_text(self):
+        reader = SimpleNamespace(pages=[SimpleNamespace()])
+        with (
+            patch.object(engine, "FULL_OCR_FALLBACK_ENABLED", True),
+            patch.object(engine, "ocr_page_text", return_value="出版说明\n本书整理说明"),
+            patch.object(engine, "classify_page", return_value={"kind": "ocr", "reason": "短条目密集页面"}),
+            patch.object(engine, "page_anchor_pair", return_value=("出版说明", "本书整理说明")),
+            patch.object(engine, "match_page_source", return_value=None),
+            patch.object(engine, "match_full_ocr_bounds", return_value=None),
+            patch.object(engine, "load_source_units", return_value=[engine.SourceUnit("正文", "body", "正文", kind="epub")]),
+        ):
+            result = engine.resolve_page({}, reader, 1, "vertical-single", allow_discovery=False, candidate_units=[])
+
+        self.assertEqual(result["kind"], "unresolved")
+        self.assertEqual(result["text"], "")
+        self.assertEqual(result["status"], "来源内容未锁定")
+
     def test_unresolved_pages_block_pdf_publication(self):
         with tempfile.TemporaryDirectory() as temporary, patch.object(engine, "JOBS_DIR", Path(temporary)):
             job_id = "1021324354657687"
@@ -202,47 +465,381 @@ class EngineTests(unittest.TestCase):
                 "layout": "horizontal",
                 "calibration": {"page": 1, "layout": "horizontal"},
             })
+            (paths.root / "text-positioned-full.pdf").write_bytes(b"stale output")
             manifest = [{"page": 1, "kind": "unresolved", "status": "未锁定", "text": "", "reason": "test"}]
             with patch.object(engine, "build_strict_page_manifest", return_value=manifest):
                 result = engine.build_full_pdf(job_id, "horizontal")
             self.assertEqual(result["state"], "error")
             self.assertFalse((paths.root / "text-positioned-full.pdf").exists())
+            self.assertTrue((paths.root / ".text-positioned-full.stale.pdf").exists())
             self.assertTrue((paths.root / "alignment-issues.csv").exists())
 
-    def test_source_omitted_pages_are_separate_from_unresolved_body(self):
+    def test_source_omitted_requires_exhausted_unit_boundaries(self):
         previous_unit = engine.SourceUnit("前章", "chapter-1", "前章正文起点天地玄黄前章末尾唯一文字", kind="epub")
         following_unit = engine.SourceUnit("后章", "chapter-2", "后章开头唯一文字宇宙洪荒后章正文终点", kind="epub")
         previous_norm, _ = engine.normalize_for_match(previous_unit.text)
-        following_norm, _ = engine.normalize_for_match(following_unit.text)
-        previous_end = previous_norm.index("前章末尾唯一文字")
-        following_start = following_norm.index("宇宙洪荒")
         manifest = [
-            {"page": 1, "kind": "body", "sourceUrl": "chapter-1", "end": previous_end},
+            {"page": 1, "kind": "body", "sourceUrl": "chapter-1", "end": len(previous_norm)},
             {"page": 2, "kind": "unresolved", "status": "未锁定", "text": ""},
             {"page": 3, "kind": "unresolved", "status": "未锁定", "text": ""},
             {"page": 4, "kind": "unresolved", "status": "未锁定", "text": ""},
-            {"page": 5, "kind": "body", "sourceUrl": "chapter-2", "start": following_start},
+            {"page": 5, "kind": "body", "sourceUrl": "chapter-2", "start": 0},
         ]
-        anchors = {
-            2: ("前章末尾唯一文字", "前章末尾唯一文字"),
-            3: ("校勘记不在电子书", "校勘记不在电子书"),
-            4: ("后章开头唯一文字", "后章开头唯一文字"),
-        }
         reader = SimpleNamespace(pages=[SimpleNamespace() for _ in manifest])
-        with patch.object(engine, "page_anchor_pair", side_effect=lambda _job, _reader, page, _layout: anchors[page]):
-            engine.mark_source_omitted_pages(
-                {}, reader, manifest, "vertical-single", [previous_unit, following_unit]
-            )
-        self.assertEqual(manifest[1]["kind"], "body")
-        self.assertEqual(manifest[2]["kind"], "source-omitted")
-        self.assertEqual(manifest[3]["kind"], "body")
+        engine.mark_source_omitted_pages(
+            {}, reader, manifest, "vertical-single", [previous_unit, following_unit]
+        )
+        self.assertEqual([item["kind"] for item in manifest[1:4]], ["source-omitted"] * 3)
         summary = engine.manifest_summary(manifest, len(manifest))
-        self.assertEqual(summary["sourceOmitted"], 1)
+        self.assertEqual(summary["sourceOmitted"], 3)
         self.assertEqual(summary["unresolved"], 0)
         self.assertEqual(summary["reviewRequired"], 0)
 
+    def test_failed_body_alignment_is_not_source_omitted(self):
+        unit = engine.SourceUnit("正文", "chapter-1", "正文尚未结束天地玄黄宇宙洪荒", kind="epub")
+        source_norm, _ = engine.normalize_for_match(unit.text)
+        manifest = [
+            {"page": 1, "kind": "body", "sourceUrl": "chapter-1", "end": len(source_norm) - 4},
+            {"page": 2, "kind": "unresolved", "status": "未锁定", "text": ""},
+        ]
+        reader = SimpleNamespace(pages=[SimpleNamespace() for _ in manifest])
+
+        engine.mark_source_omitted_pages({}, reader, manifest, "vertical-single", [unit])
+
+        self.assertEqual(manifest[1]["kind"], "unresolved")
+
+    def test_only_verified_source_omitted_pages_receive_same_page_ocr(self):
+        manifest = [
+            {"page": 1, "kind": "source-omitted", "sourceAbsentVerified": True, "text": ""},
+            {"page": 2, "kind": "unresolved", "text": ""},
+            {"page": 3, "kind": "source-omitted", "text": ""},
+        ]
+        with tempfile.TemporaryDirectory() as temporary:
+            with (
+                patch.object(engine, "full_ocr_cache_path", return_value=Path(temporary) / "missing.txt"),
+                patch.object(engine, "ocr_page_text", return_value="本页目录 OCR 文字") as ocr,
+            ):
+                completed = engine.fill_source_omitted_ocr({}, manifest, "vertical-single")
+
+        self.assertEqual(completed, 1)
+        ocr.assert_called_once_with({}, 1, "vertical-single", anchors_only=False)
+        self.assertEqual(manifest[0]["status"], "来源未收录·整页 OCR")
+        self.assertEqual(manifest[0]["text"], "本页目录 OCR 文字")
+        self.assertEqual(manifest[0]["textOrigin"], "page-ocr")
+        self.assertEqual(manifest[1]["kind"], "unresolved")
+        self.assertEqual(manifest[1]["text"], "")
+        self.assertEqual(manifest[2]["text"], "")
+        summary = engine.manifest_summary(manifest, len(manifest))
+        self.assertEqual(summary["sourceOmitted"], 2)
+        self.assertEqual(summary["sourceOmittedOcr"], 1)
+
+    def test_throughput_metrics_reports_rate_eta_and_memory(self):
+        with (
+            patch.object(engine.time, "time", return_value=160.0),
+            patch.object(engine, "available_memory_mb", return_value=2048),
+        ):
+            metrics = engine.throughput_metrics(100.0, 30, 60, workers=3)
+
+        self.assertEqual(metrics["pagesPerMinute"], 30.0)
+        self.assertEqual(metrics["etaSeconds"], 60)
+        self.assertEqual(metrics["freeMemoryMB"], 2048)
+        self.assertEqual(metrics["workers"], 3)
+
+    def test_adaptive_workers_respects_available_memory(self):
+        with (
+            patch.object(engine.os, "cpu_count", return_value=16),
+            patch.object(engine, "available_memory_mb", return_value=1800),
+        ):
+            self.assertEqual(engine.adaptive_ocr_workers(), 1)
+        with (
+            patch.object(engine.os, "cpu_count", return_value=16),
+            patch.object(engine, "available_memory_mb", return_value=6000),
+        ):
+            self.assertEqual(engine.adaptive_ocr_workers(), 4)
+
+    def test_anchor_worker_retries_high_dpi_when_low_dpi_evidence_is_weak(self):
+        with tempfile.TemporaryDirectory() as temporary, patch.object(engine, "JOBS_DIR", Path(temporary)):
+            job_id = "1122334455667788"
+            paths = engine.job_paths(job_id)
+            paths.root.mkdir(parents=True)
+            engine.atomic_write_json(paths.meta, {"id": job_id, "pdf": "unused.pdf"})
+            image = Image.new("RGB", (100, 120), "white")
+            with (
+                patch.object(engine, "render_page_images_persistent", side_effect=[[image], [image]]) as render,
+                patch.object(engine, "ocr_page_anchor_pair", side_effect=[("弱证据", "弱证据"), ("高分辨率页首", "高分辨率页尾")]) as anchors,
+                patch.object(engine, "anchor_pair_strong_for_source", return_value=False),
+            ):
+                result = engine.precompute_anchor_worker((job_id, (1,), "vertical-single"))
+
+            self.assertEqual(result, [(1, True, "")])
+            self.assertEqual([call.kwargs["dpi"] for call in render.call_args_list], [120, 140])
+            self.assertEqual([call.kwargs["render_dpi"] for call in anchors.call_args_list], [120, 140])
+
+    def test_multi_page_unresolved_run_recovers_only_with_internal_boundaries(self):
+        unit = engine.SourceUnit(
+            "正文",
+            "chapter-1",
+            "前页正文第一页开头唯一甲甲甲第一页末尾唯一第二页开头唯一乙乙乙第二页末尾唯一后页正文",
+            kind="epub",
+        )
+        source_norm, _ = engine.normalize_for_match(unit.text)
+        previous_end = len(engine.normalize_for_match("前页正文")[0])
+        following_start = source_norm.index(engine.normalize_for_match("后页正文")[0])
+        manifest = [
+            {"page": 1, "kind": "body", "sourceUrl": "chapter-1", "end": previous_end, "confidence": 96},
+            {"page": 2, "kind": "unresolved", "status": "未锁定", "text": ""},
+            {"page": 3, "kind": "unresolved", "status": "未锁定", "text": ""},
+            {"page": 4, "kind": "body", "sourceUrl": "chapter-1", "start": following_start, "confidence": 96},
+        ]
+        anchors = {
+            2: ("第一页开头唯一", "第一页末尾唯一"),
+            3: ("第二页开头唯一", "第二页末尾唯一"),
+        }
+        reader = SimpleNamespace(pages=[SimpleNamespace() for _ in manifest])
+        with patch.object(engine, "page_anchor_pair", side_effect=lambda _job, _reader, page, _layout: anchors[page]):
+            recovered = engine.recover_unresolved_runs(
+                {}, reader, manifest, "vertical-single", {"chapter-1": unit}
+            )
+
+        self.assertEqual(recovered, 2)
+        self.assertEqual([item["kind"] for item in manifest[1:3]], ["body", "body"])
+        self.assertLess(manifest[1]["start"], manifest[1]["end"])
+        self.assertEqual(manifest[1]["end"], manifest[2]["start"])
+        self.assertEqual(manifest[1]["status"], "多页缺口双锚恢复")
+
+    def test_single_character_page_start_is_preserved(self):
+        source = "上一页结尾。侯正文开头唯一文字天地玄黄，正文页尾唯一文字。下一页开头"
+        result = engine.strict_pair_in_text(
+            source,
+            "侯\n正文开头唯一文字",
+            "正文页尾唯一文字",
+        )
+
+        self.assertIsNotNone(result)
+        self.assertTrue(result["text"].startswith("侯"))
+        self.assertFalse(result["text"].startswith("上一页"))
+
+    def test_punctuation_page_start_is_preserved(self):
+        source = "上一页结尾。正文开头唯一文字天地玄黄，正文页尾唯一文字。下一页开头"
+        result = engine.strict_pair_in_text(
+            source,
+            "。\n正文开头唯一文字",
+            "正文页尾唯一文字",
+        )
+
+        self.assertIsNotNone(result)
+        self.assertTrue(result["text"].startswith("。正文开头"))
+
+    def test_internal_ocr_punctuation_omission_keeps_exact_outer_characters(self):
+        source = "汉建安六年，郡举上计掾。魏武纳之，于是务农积谷，国用丰赡。帝又言。"
+        result = engine.strict_pair_in_text(
+            source,
+            "汉建安六年郡举上计掾",
+            "于是务农积谷国用丰赡帝又",
+        )
+
+        self.assertIsNotNone(result)
+        self.assertTrue(result["text"].startswith("汉建安六年，"))
+        self.assertTrue(result["text"].endswith("帝又"))
+
+    def test_wrong_recognized_outer_punctuation_is_not_silently_replaced(self):
+        source = "正文开头唯一文字，正文页尾唯一文字。"
+        result = engine.strict_pair_in_text(
+            source,
+            "正文开头唯一文字",
+            "正文页尾唯一文字°",
+        )
+
+        self.assertIsNone(result)
+
+    def test_page_can_strictly_span_adjacent_source_units(self):
+        units = [
+            engine.SourceUnit(
+                "前章", "chapter-1", "前章正文天地玄黄前章页尾唯一文字", kind="epub"
+            ),
+            engine.SourceUnit(
+                "后章", "chapter-2", "后章标题后章页首唯一文字宇宙洪荒正文", kind="epub"
+            ),
+        ]
+        windows = engine.source_alignment_windows(units)
+
+        result = engine.match_page_source(
+            {}, "前章页尾唯一文字", "后章页首唯一文字", False, windows
+        )
+
+        self.assertIsNotNone(result)
+        self.assertTrue(result["crossesSourceUnit"])
+        self.assertEqual((result["sourceStartOrder"], result["sourceEndOrder"]), (0, 1))
+        self.assertEqual((result["sourceStartUrl"], result["sourceEndUrl"]), ("chapter-1", "chapter-2"))
+        self.assertIn("前章页尾唯一文字后章标题后章页首唯一文字", result["text"])
+        self.assertLess(result["globalStart"], result["globalEnd"])
+
+    def test_cross_unit_global_boundary_can_stream_to_following_unit(self):
+        previous = {
+            "kind": "body", "status": "跨章节双头锁边",
+            "sourceUrl": "cross-unit:0", "globalRawStart": 80, "globalRawEnd": 118,
+            "globalStart": 80, "globalEnd": 120,
+        }
+        current = {
+            "kind": "body", "status": "双头锁边",
+            "sourceUrl": "chapter-2", "globalRawStart": 120, "globalRawEnd": 160,
+            "globalStart": 120, "globalEnd": 160,
+        }
+
+        self.assertTrue(engine.strict_pair_committable(previous, current))
+        self.assertEqual(engine.enforce_adjacent_page_boundaries([previous, current]), 0)
+
+    def test_continuity_never_overwrites_recognized_page_start(self):
+        previous = {"kind": "body", "sourceUrl": "chapter-1", "end": 10}
+        current = {
+            "kind": "body",
+            "sourceUrl": "chapter-1",
+            "start": 14,
+            "end": 40,
+            "text": "侯正文",
+            "confidence": 96,
+            "startAnchor": "侯",
+        }
+
+        result = engine.apply_previous_page_continuity({}, previous, current)
+
+        self.assertEqual(result["kind"], "unresolved")
+        self.assertEqual(result["status"], "页界未唯一锁定")
+        self.assertEqual(result["boundaryGap"], 4)
+        self.assertEqual(result["startAnchor"], "侯")
+        self.assertEqual(result["text"], "")
+
+    def test_adjacent_pages_compare_raw_punctuation_boundaries(self):
+        manifest = [
+            {
+                "page": 1, "kind": "body", "sourceUrl": "chapter-1",
+                "start": 0, "end": 20, "rawStart": 0, "rawEnd": 22, "text": "前页正文",
+            },
+            {
+                "page": 2, "kind": "body", "sourceUrl": "chapter-1",
+                "start": 20, "end": 40, "rawStart": 21, "rawEnd": 43, "text": "。后页正文",
+            },
+        ]
+
+        conflicts = engine.enforce_adjacent_page_boundaries(manifest)
+
+        self.assertEqual(conflicts, 1)
+        self.assertEqual([item["kind"] for item in manifest], ["body", "body"])
+        self.assertTrue(all(item.get("continuityWarning") for item in manifest))
+
+    def test_legacy_continuity_results_require_review(self):
+        manifest = [
+            {"kind": "body", "status": "双锁连续补首", "confidence": 91},
+            {"kind": "body", "status": "双锁连续去重", "confidence": 90},
+            {"kind": "body", "status": "双头锁边", "confidence": 95},
+        ]
+
+        summary = engine.manifest_summary(manifest, len(manifest))
+
+        self.assertEqual(summary["matched"], 1)
+        self.assertEqual(summary["boundaryReview"], 2)
+        self.assertEqual(summary["reviewRequired"], 2)
+
+    def test_alignment_quality_regression_is_blocked_only_when_material(self):
+        previous = {"matched": 1981, "constrained": 710, "unresolved": 300, "reviewRequired": 300}
+        regressed = {"matched": 223, "constrained": 0, "unresolved": 3149, "reviewRequired": 3149}
+        slight_change = {"matched": 1960, "constrained": 690, "unresolved": 340, "reviewRequired": 340}
+
+        self.assertTrue(engine.alignment_quality_regressed(regressed, previous, 3372))
+        self.assertFalse(engine.alignment_quality_regressed(slight_change, previous, 3372))
+        self.assertFalse(engine.alignment_quality_regressed(previous, regressed, 3372))
+
+    def test_chapter_order_does_not_move_backward(self):
+        units = [
+            engine.SourceUnit("第一章", "chapter-1", "第一章正文", kind="epub"),
+            engine.SourceUnit("第二章", "chapter-2", "第二章正文", kind="epub"),
+        ]
+        resolved_pages = [
+            {"page": 1, "kind": "body", "sourceUrl": "chapter-1", "sourceTitle": "第一章", "start": 0, "end": 4, "text": "第一章正文", "confidence": 99},
+            {"page": 2, "kind": "body", "sourceUrl": "chapter-2", "sourceTitle": "第二章", "start": 0, "end": 4, "text": "第二章正文", "confidence": 99},
+            {"page": 3, "kind": "body", "sourceUrl": "chapter-1", "sourceTitle": "第一章", "start": 4, "end": 8, "text": "回跳正文", "confidence": 99},
+        ]
+        reader = SimpleNamespace(pages=[SimpleNamespace() for _ in resolved_pages])
+        with (
+            patch.object(engine, "load_source_units", return_value=units),
+            patch.object(engine, "resolve_page", side_effect=resolved_pages),
+            patch.object(engine, "enforce_recognized_page_edges", return_value=0),
+            patch.object(engine, "mark_source_omitted_pages", return_value=None),
+        ):
+            manifest = engine.build_strict_page_manifest({}, reader, "vertical-single")
+
+        self.assertEqual(manifest[2]["kind"], "unresolved")
+        self.assertEqual(manifest[2]["status"], "章节顺序冲突")
+
+    def test_chapter_transition_title_page_can_attach_to_next_unit_prefix(self):
+        previous_unit = engine.SourceUnit("志第一", "chapter-1", "前章正文结束", kind="epub")
+        following_unit = engine.SourceUnit("志第二", "chapter-2", "志第二新章正文开始", kind="epub")
+        following_start = engine.normalize_for_match(following_unit.text)[0].index("新章正文")
+        manifest = [
+            {"page": 1, "kind": "body", "sourceUrl": "chapter-1", "end": len(engine.normalize_for_match(previous_unit.text)[0]), "confidence": 96},
+            {"page": 2, "kind": "unresolved", "status": "未锁定", "text": ""},
+            {"page": 3, "kind": "body", "sourceUrl": "chapter-2", "start": following_start, "confidence": 96},
+        ]
+        reader = SimpleNamespace(pages=[SimpleNamespace() for _ in manifest])
+        with patch.object(engine, "page_anchor_pair", return_value=("志第二", "志第二")):
+            recovered = engine.recover_chapter_transition_runs(
+                {}, reader, manifest, "vertical-single",
+                [previous_unit, following_unit],
+                {"chapter-1": 0, "chapter-2": 1},
+            )
+
+        self.assertEqual(recovered, 1)
+        self.assertEqual(manifest[1]["kind"], "body")
+        self.assertEqual(manifest[1]["status"], "章节过渡后章约束")
+        self.assertEqual(manifest[1]["sourceUrl"], "chapter-2")
+
+    def test_chapter_transition_overlap_stays_unresolved(self):
+        previous_unit = engine.SourceUnit("志第一", "chapter-1", "前章正文结束", kind="epub")
+        following_unit = engine.SourceUnit("志第二", "chapter-2", "志第二新章正文开始", kind="epub")
+        following_start = engine.normalize_for_match(following_unit.text)[0].index("新章正文")
+        manifest = [
+            {"page": 1, "kind": "body", "sourceUrl": "chapter-1", "end": 0, "confidence": 96},
+            {"page": 2, "kind": "unresolved", "status": "未锁定", "text": ""},
+            {"page": 3, "kind": "body", "sourceUrl": "chapter-2", "start": following_start, "confidence": 96},
+        ]
+        reader = SimpleNamespace(pages=[SimpleNamespace() for _ in manifest])
+        with patch.object(engine, "page_anchor_pair", return_value=("志第一志第二", "")):
+            recovered = engine.recover_chapter_transition_runs(
+                {}, reader, manifest, "vertical-single",
+                [previous_unit, following_unit],
+                {"chapter-1": 0, "chapter-2": 1},
+            )
+
+        self.assertEqual(recovered, 0)
+        self.assertEqual(manifest[1]["kind"], "unresolved")
+
 
 class FileServerTests(unittest.TestCase):
+    def test_job_diagnostics_summarizes_unresolved_runs(self):
+        with tempfile.TemporaryDirectory() as temporary, patch.object(engine, "JOBS_DIR", Path(temporary)):
+            job_id = "1122334455667788"
+            paths = engine.job_paths(job_id)
+            paths.root.mkdir(parents=True)
+            engine.atomic_write_json(paths.root / "page-text-manifest.json", {"pages": [
+                {"page": 1, "kind": "body"},
+                {"page": 2, "kind": "unresolved", "reason": "缺少页尾锚点"},
+                {"page": 3, "kind": "unresolved", "reason": "缺少页尾锚点"},
+                {"page": 4, "kind": "body"},
+                {"page": 5, "kind": "unresolved", "status": "章节顺序冲突"},
+            ]})
+            server.DIAGNOSTICS_CACHE.clear()
+
+            result = server.build_job_diagnostics(job_id, expected_unresolved=3)
+
+            self.assertTrue(result["available"])
+            self.assertTrue(result["current"])
+            self.assertEqual(result["unresolved"], 3)
+            self.assertEqual(result["runCount"], 2)
+            self.assertEqual(result["longestRun"], 2)
+            self.assertEqual(result["runLengthBuckets"]["one"], 1)
+            self.assertEqual(result["runLengthBuckets"]["two"], 1)
+            self.assertEqual(result["sourceOrderConflicts"], 1)
+
     def test_pdf_supports_range_and_head_requests(self):
         with tempfile.TemporaryDirectory() as temporary:
             jobs = Path(temporary)

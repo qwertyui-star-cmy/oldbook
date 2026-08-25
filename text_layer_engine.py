@@ -2,9 +2,13 @@ from __future__ import annotations
 
 import csv
 import concurrent.futures
+import atexit
+import bisect
+import ctypes
 import hashlib
 import io
 import json
+import math
 import os
 import posixpath
 import re
@@ -12,6 +16,7 @@ import shutil
 import subprocess
 import threading
 import time
+import unicodedata
 import zipfile
 import sys
 import xml.etree.ElementTree as ET
@@ -20,8 +25,9 @@ from difflib import SequenceMatcher
 from html.parser import HTMLParser
 from pathlib import Path
 from string import punctuation
+from typing import Callable
 from urllib.parse import quote, urlencode, urljoin, urlparse
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from PIL import Image, ImageChops, ImageDraw
@@ -72,6 +78,14 @@ ROOT = Path(__file__).resolve().parent
 VENDOR_PYTHON = ROOT / ".vendor" / "python"
 if VENDOR_PYTHON.exists() and str(VENDOR_PYTHON) not in sys.path:
     sys.path.insert(0, str(VENDOR_PYTHON))
+try:
+    import pypdfium2 as pdfium
+except ImportError:
+    pdfium = None
+try:
+    from pypinyin import lazy_pinyin
+except ImportError:
+    lazy_pinyin = None
 JOBS_DIR = ROOT / ".cache" / "text-layer-jobs"
 POPPLER = Path.home() / ".cache" / "codex-runtimes" / "codex-primary-runtime" / "dependencies" / "native" / "poppler" / "Library" / "bin" / "pdftoppm.exe"
 CN_PUNCT = "，。！？；：、“”‘’（）《》〈〉【】〔〕［］—…·　「」『』﹁﹂﹃﹄"
@@ -80,7 +94,8 @@ TEXT_FONT = "HanText"
 TEXT_FONT_REGISTERED = False
 EXTB_TEXT_FONT = "HanTextExtB"
 EXTB_TEXT_FONT_REGISTERED = False
-LAYOUT_ENGINE_VERSION = "vertical-local-search-v8-reader-search"
+LAYOUT_ENGINE_VERSION = "vertical-strict-edge-v17-boundary-review"
+ANCHOR_CACHE_VERSION = 10
 TEXT_FONT_CANDIDATES = [
     Path(r"C:\Windows\Fonts\STSONG.TTF"),
     Path(r"C:\Windows\Fonts\simsun.ttc"),
@@ -92,8 +107,6 @@ EXTB_TEXT_FONT_CANDIDATES = [
 ]
 OCR_ENGINE = None
 OPENCC_CONVERTER = None
-OPENCC_S2T_CONVERTER = None
-OPENCC_T2S_CONVERTER = None
 STATUS_LOCKS: dict[str, threading.RLock] = {}
 STATUS_LOCKS_GUARD = threading.Lock()
 OCR_IDLE_TIMEOUT_SECONDS = max(60, int(os.environ.get("TEXT_LAYER_OCR_IDLE_TIMEOUT", "600") or "600"))
@@ -103,11 +116,13 @@ FAST_MANIFEST_FUZZY_ENABLED = str(os.environ.get("TEXT_LAYER_FAST_FUZZY") or "")
 ALLOW_UNRESOLVED_OUTPUT = str(os.environ.get("TEXT_LAYER_ALLOW_UNRESOLVED_OUTPUT") or "0").strip().lower() in {"1", "true", "yes", "on"}
 ALLOW_ESTIMATED_OUTPUT = str(os.environ.get("TEXT_LAYER_ALLOW_ESTIMATED_OUTPUT") or "0").strip().lower() in {"1", "true", "yes", "on"}
 ALLOW_OCR_OUTPUT = str(os.environ.get("TEXT_LAYER_ALLOW_OCR_OUTPUT") or "0").strip().lower() in {"1", "true", "yes", "on"}
-SEARCH_ALIASES_ENABLED = str(os.environ.get("TEXT_LAYER_SEARCH_ALIASES") or "1").strip().lower() in {"1", "true", "yes", "on"}
+STRICT_BOUNDARY_BLOCK_STATUSES = {"页界未唯一锁定", "页边文字未精确对应"}
 SOURCE_UNITS_CACHE: dict[str, tuple[float, int, list["SourceUnit"]]] = {}
 SOURCE_UNITS_CACHE_LOCK = threading.Lock()
 NORMALIZED_SOURCE_CACHE: dict[int, tuple[str, str, list[int]]] = {}
 NORMALIZED_SOURCE_CACHE_LOCK = threading.Lock()
+SOURCE_SEARCH_CORPUS_CACHE: dict[str, str] = {}
+PDFIUM_DOCUMENTS: dict[tuple[str, int, int], object] = {}
 PIPELINE_STAGES = (
     ("input", "来源与任务检查"),
     ("ocr", "页边 OCR 缓存"),
@@ -168,13 +183,30 @@ class LinkHTMLParser(HTMLParser):
         super().__init__()
         self.base_url = base_url
         self.links: list[str] = []
+        self.labeled_links: list[tuple[str, str]] = []
+        self._active_href = ""
+        self._active_text: list[str] = []
 
     def handle_starttag(self, tag: str, attrs) -> None:
         if tag.lower() != "a":
             return
         href = dict(attrs).get("href")
         if href:
-            self.links.append(urljoin(self.base_url, href))
+            absolute = urljoin(self.base_url, href)
+            self.links.append(absolute)
+            self._active_href = absolute
+            self._active_text = []
+
+    def handle_data(self, data: str) -> None:
+        if self._active_href and data.strip():
+            self._active_text.append(data.strip())
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.lower() == "a" and self._active_href:
+            label = re.sub(r"\s+", " ", " ".join(self._active_text)).strip()
+            self.labeled_links.append((self._active_href, label))
+            self._active_href = ""
+            self._active_text = []
 
 
 @dataclass
@@ -203,6 +235,57 @@ class SourceUnit:
         }
 
 
+@dataclass
+class SourceWindow:
+    title: str
+    url: str
+    text: str
+    order: int
+    kind: str
+    start_order: int
+    end_order: int
+    start_url: str
+    end_url: str
+    start_title: str
+    end_title: str
+    global_norm_start: int
+    global_raw_start: int
+    boundary: int | None = None
+
+
+def source_alignment_windows(units: list[SourceUnit]) -> list[SourceWindow]:
+    """Expose source units in one monotonic coordinate space, including adjacent-unit pages."""
+    windows = []
+    norm_cursor = 0
+    raw_cursor = 0
+    positions = []
+    for index, unit in enumerate(units):
+        unit_norm, _ = normalize_source_cached(unit.text)
+        key = unit.url or unit.title
+        positions.append((norm_cursor, raw_cursor, len(unit_norm)))
+        windows.append(SourceWindow(
+            unit.title, key, unit.text, index, unit.kind,
+            index, index, key, key, unit.title, unit.title,
+            norm_cursor, raw_cursor,
+        ))
+        norm_cursor += len(unit_norm)
+        raw_cursor += len(unit.text)
+    for index, (left, right) in enumerate(zip(units, units[1:])):
+        norm_start, raw_start, left_norm_length = positions[index]
+        left_key = left.url or left.title
+        right_key = right.url or right.title
+        windows.append(SourceWindow(
+            f"{left.title} / {right.title}",
+            f"cross-unit:{index}:{left_key}|{right_key}",
+            left.text + right.text,
+            index,
+            left.kind if left.kind == right.kind else "mixed-authority",
+            index, index + 1, left_key, right_key, left.title, right.title,
+            norm_start, raw_start, left_norm_length,
+        ))
+    return windows
+
+
 def safe_name(name: str, fallback: str) -> str:
     cleaned = re.sub(r"[^\w.\-\u4e00-\u9fff]+", "_", name, flags=re.UNICODE).strip("._")
     return cleaned or fallback
@@ -213,11 +296,83 @@ def make_job_id(seed: str) -> str:
     return hashlib.sha1(raw).hexdigest()[:16]
 
 
+def job_id_from_root(root: Path) -> str:
+    meta_path = root / "job.json"
+    if meta_path.exists():
+        try:
+            value = str(json.loads(meta_path.read_text(encoding="utf-8")).get("id") or "").lower()
+            if re.fullmatch(r"[0-9a-f]{16}", value):
+                return value
+        except (OSError, json.JSONDecodeError):
+            pass
+    match = re.search(r"(?:^|-)([0-9a-f]{16})$", root.name.lower())
+    return match.group(1) if match else ""
+
+
+def book_package_slug(filename: str) -> str:
+    stem = Path(str(filename or "book")).stem
+    stem = re.split(r"[_\-—（(【\[]", stem, maxsplit=1)[0].strip() or stem
+    if lazy_pinyin:
+        value = "".join(lazy_pinyin(stem, errors=lambda chars: list(chars)))
+    else:
+        value = stem
+    value = unicodedata.normalize("NFKD", value).encode("ascii", errors="ignore").decode("ascii")
+    value = re.sub(r"[^a-zA-Z0-9]+", "-", value).strip("-").lower()
+    return (value or "book")[:48].rstrip("-")
+
+
+def new_job_paths(job_id: str, pdf_original: str) -> JobPaths:
+    root = JOBS_DIR / f"{book_package_slug(pdf_original)}-{job_id}"
+    return JobPaths(root=root, pdf=root / "source.pdf", source=root / "source.txt", meta=root / "job.json")
+
+
+def migrate_legacy_job_packages() -> int:
+    if not JOBS_DIR.exists():
+        return 0
+    migrated = 0
+    for root in JOBS_DIR.iterdir():
+        if not root.is_dir() or not re.fullmatch(r"[0-9a-f]{16}", root.name.lower()):
+            continue
+        meta_path = root / "job.json"
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        job_id = str(meta.get("id") or root.name).lower()
+        target = new_job_paths(job_id, str(meta.get("pdfOriginal") or "book.pdf")).root
+        if target.exists():
+            continue
+        old_root = str(root.resolve())
+        root.rename(target)
+        for key in ("pdf", "sourceText", "sourceArchive"):
+            value = str(meta.get(key) or "")
+            if value.startswith(old_root):
+                meta[key] = str(target.resolve()) + value[len(old_root):]
+        atomic_write_json(target / "job.json", meta)
+        status_path = target / "full-status.json"
+        if status_path.exists():
+            try:
+                status = json.loads(status_path.read_text(encoding="utf-8"))
+                for output in status.get("outputs") or []:
+                    value = str(output.get("path") or "")
+                    if value.startswith(old_root):
+                        output["path"] = str(target.resolve()) + value[len(old_root):]
+                atomic_write_json(status_path, status)
+            except (OSError, json.JSONDecodeError, TypeError):
+                pass
+        migrated += 1
+    return migrated
+
+
 def job_paths(job_id: str) -> JobPaths:
     job_id = str(job_id).strip().lower()
     if not re.fullmatch(r"[0-9a-f]{16}", job_id):
         raise ValueError("任务编号无效。")
     root = JOBS_DIR / job_id
+    if not root.exists() and JOBS_DIR.exists():
+        matches = [candidate for candidate in JOBS_DIR.glob(f"*-{job_id}") if candidate.is_dir()]
+        if len(matches) == 1:
+            root = matches[0]
     return JobPaths(root=root, pdf=root / "source.pdf", source=root / "source.txt", meta=root / "job.json")
 
 
@@ -229,7 +384,14 @@ def atomic_write_bytes(path: Path, payload: bytes) -> None:
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temporary, path)
+        for attempt in range(6):
+            try:
+                os.replace(temporary, path)
+                break
+            except PermissionError:
+                if attempt == 5:
+                    raise
+                time.sleep(0.05 * (attempt + 1))
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -368,8 +530,83 @@ def save_source_units(job: dict, units: list[SourceUnit]) -> None:
 
 def write_upload(field, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    field.file.seek(0)
     with path.open("wb") as handle:
         shutil.copyfileobj(field.file, handle)
+
+
+def upload_sha256(field) -> str:
+    digest = hashlib.sha256()
+    field.file.seek(0)
+    while chunk := field.file.read(1024 * 1024):
+        digest.update(chunk)
+    field.file.seek(0)
+    return digest.hexdigest()
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def job_input_fingerprint(pdf_digest: str, source_identity: str, layout: str) -> str:
+    payload = f"pdf:{pdf_digest}\nsource:{source_identity}\nlayout:{layout.strip().lower()}"
+    return hashlib.sha256(payload.encode("utf-8", errors="ignore")).hexdigest()
+
+
+def reusable_job_id(
+    fingerprint: str,
+    pdf_original: str,
+    source_original: str,
+    pdf_digest: str,
+    source_identity: str,
+    requested_layout: str,
+) -> str:
+    if not JOBS_DIR.exists():
+        return ""
+    for meta_path in sorted(JOBS_DIR.glob("*/job.json"), key=lambda path: path.stat().st_mtime, reverse=True):
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if str(meta.get("inputFingerprint") or "") == fingerprint:
+            return str(meta.get("id") or job_id_from_root(meta_path.parent))
+        if meta.get("pdfOriginal") != pdf_original or str(meta.get("sourceOriginal") or "") != source_original:
+            continue
+        candidate_layout = str(meta.get("requestedLayout") or meta.get("layout") or "auto")
+        if requested_layout != "auto" and candidate_layout != requested_layout:
+            continue
+        candidate_job_id = str(meta.get("id") or job_id_from_root(meta_path.parent))
+        if not candidate_job_id:
+            continue
+        paths = job_paths(candidate_job_id)
+        candidate_pdf_digest = str(meta.get("pdfSha256") or "")
+        if not candidate_pdf_digest and paths.pdf.exists():
+            candidate_pdf_digest = file_sha256(paths.pdf)
+        candidate_source_identity = str(meta.get("sourceIdentity") or "")
+        if not candidate_source_identity:
+            if source_original.startswith(("http://", "https://")):
+                candidate_source_identity = f"url:{source_original.strip()}"
+            else:
+                archive_value = str(meta.get("sourceArchive") or "")
+                archive = Path(archive_value) if archive_value else None
+                if archive and archive.exists():
+                    candidate_source_identity = f"file:{file_sha256(archive)}"
+                elif not source_original:
+                    candidate_source_identity = "none"
+        if candidate_pdf_digest == pdf_digest and candidate_source_identity == source_identity:
+            meta.update({
+                "inputFingerprint": fingerprint,
+                "pdfSha256": pdf_digest,
+                "sourceIdentity": source_identity,
+                "requestedLayout": requested_layout,
+            })
+            atomic_write_json(meta_path, meta)
+            return candidate_job_id
+    return ""
 
 
 def html_to_text(value: str) -> str:
@@ -454,20 +691,44 @@ def epub_spine_units(path: Path) -> list[SourceUnit]:
             opf_name = str(rootfile.attrib.get("full-path") or "") if rootfile is not None else ""
             package = ET.fromstring(archive.read(opf_name))
             opf_dir = posixpath.dirname(opf_name)
-            manifest = {
-                str(item.attrib.get("id") or ""): str(item.attrib.get("href") or "")
+            manifest_items = {
+                str(item.attrib.get("id") or ""): item
                 for item in package.findall(".//{*}manifest/{*}item")
             }
+            manifest = {
+                item_id: str(item.attrib.get("href") or "")
+                for item_id, item in manifest_items.items()
+            }
+            guide_references = package.findall(".//{*}guide/{*}reference")
             guide_titles = {
                 posixpath.normpath(posixpath.join(opf_dir, str(item.attrib.get("href") or ""))):
                 str(item.attrib.get("title") or "")
-                for item in package.findall(".//{*}guide/{*}reference")
+                for item in guide_references
             }
             for itemref in package.findall(".//{*}spine/{*}itemref"):
                 href = manifest.get(str(itemref.attrib.get("idref") or ""), "")
                 archive_name = posixpath.normpath(posixpath.join(opf_dir, href))
                 if archive_name in names and archive_name.lower().endswith((".html", ".xhtml", ".htm")):
                     ordered.append((archive_name, guide_titles.get(archive_name, "")))
+            ordered_names = {name for name, _ in ordered}
+            navigation = []
+            for item in manifest_items.values():
+                properties = str(item.attrib.get("properties") or "").split()
+                if "nav" not in properties:
+                    continue
+                archive_name = posixpath.normpath(posixpath.join(opf_dir, str(item.attrib.get("href") or "")))
+                if archive_name in names and archive_name not in ordered_names and archive_name.lower().endswith((".html", ".xhtml", ".htm")):
+                    navigation.append((archive_name, guide_titles.get(archive_name, "目录")))
+                    ordered_names.add(archive_name)
+            for reference in guide_references:
+                if str(reference.attrib.get("type") or "").lower() != "toc":
+                    continue
+                archive_name = posixpath.normpath(posixpath.join(opf_dir, str(reference.attrib.get("href") or "")))
+                if archive_name in names and archive_name not in ordered_names and archive_name.lower().endswith((".html", ".xhtml", ".htm")):
+                    navigation.append((archive_name, str(reference.attrib.get("title") or "目录")))
+                    ordered_names.add(archive_name)
+            if navigation:
+                ordered = navigation + ordered
         except Exception:
             ordered = []
 
@@ -556,62 +817,6 @@ def normalize_cjk_variant(char: str) -> str:
     return char
 
 
-def opencc_converter(config: str):
-    global OPENCC_S2T_CONVERTER, OPENCC_T2S_CONVERTER
-    target = "OPENCC_S2T_CONVERTER" if config == "s2t" else "OPENCC_T2S_CONVERTER"
-    current = globals()[target]
-    if current is None:
-        try:
-            from opencc import OpenCC
-            current = OpenCC(config)
-        except Exception:
-            current = False
-        globals()[target] = current
-    return current
-
-
-def detect_cjk_script(text: str) -> str:
-    s2t = opencc_converter("s2t")
-    t2s = opencc_converter("t2s")
-    if not s2t or not t2s:
-        return "unknown"
-    chars = [char for char in text if "\u3400" <= char <= "\u9fff"]
-    traditional = sum(1 for char in chars if t2s.convert(char) != char)
-    simplified = sum(1 for char in chars if s2t.convert(char) != char)
-    if traditional >= 2 and traditional > simplified * 1.2:
-        return "traditional"
-    if simplified >= 2 and simplified > traditional * 1.2:
-        return "simplified"
-    return "unknown"
-
-
-def adapt_text_to_scan_script(text: str, scan_text: str) -> tuple[str, str]:
-    glyph_adjusted = False
-    common_votes = sum(1 for common_variant in COMMON_GLYPH_VARIANTS.values() if common_variant in scan_text)
-    source_votes = sum(1 for source_variant in COMMON_GLYPH_VARIANTS if source_variant in scan_text)
-    for source_variant, common_variant in COMMON_GLYPH_VARIANTS.items():
-        if source_variant in text and (common_variant in scan_text or common_votes > source_votes):
-            text = text.replace(source_variant, common_variant)
-            glyph_adjusted = True
-        elif common_variant in text and (source_variant in scan_text or source_votes > common_votes):
-            text = text.replace(common_variant, source_variant)
-            glyph_adjusted = True
-    for source_variant in ("䃅", "磾", "㻅"):
-        safe_variant = COMMON_GLYPH_VARIANTS.get(source_variant)
-        if safe_variant and source_variant in text:
-            text = text.replace(source_variant, safe_variant)
-            glyph_adjusted = True
-    target = detect_cjk_script(scan_text)
-    source = detect_cjk_script(text)
-    if target == "traditional" and source == "simplified":
-        converter = opencc_converter("s2t")
-        return (converter.convert(text), "简转繁并统一字形") if converter else (text, "已统一常见字形" if glyph_adjusted else "")
-    if target == "simplified" and source == "traditional":
-        converter = opencc_converter("t2s")
-        return (converter.convert(text), "繁转简并统一字形") if converter else (text, "已统一常见字形" if glyph_adjusted else "")
-    return text, "已统一常见字形" if glyph_adjusted else ""
-
-
 def request_bytes(url: str, limit: int = 8 * 1024 * 1024) -> tuple[bytes, str, str]:
     request = Request(url, headers={"User-Agent": "TextLocator/0.2 (+local text alignment)"})
     for attempt in range(3):
@@ -621,10 +826,14 @@ def request_bytes(url: str, limit: int = 8 * 1024 * 1024) -> tuple[bytes, str, s
                 content_type = response.headers.get_content_type() or ""
                 return response.read(limit), charset, content_type
         except HTTPError as exc:
-            if exc.code != 429 or attempt == 2:
+            if exc.code not in {408, 429, 500, 502, 503, 504} or attempt == 2:
                 raise
             delay = min(8, max(2, int(exc.headers.get("Retry-After") or 2)))
             time.sleep(delay)
+        except (URLError, TimeoutError, OSError):
+            if attempt == 2:
+                raise
+            time.sleep(2 ** attempt)
     raise RuntimeError("网页来源暂时无法读取。")
 
 
@@ -718,17 +927,28 @@ def fetch_chapter_units(base_url: str, html: str) -> list[SourceUnit]:
     parser.feed(html)
     base_host = urlparse(base_url).netloc
     chapter_links = []
+    generic_links = []
     seen = set()
+    labels = {link: label for link, label in parser.labeled_links}
     for link in parser.links:
         parsed = urlparse(link)
         if parsed.netloc != base_host:
             continue
-        if not re.search(r"/(?:novel/\d+/chapter|read/\d+)/\d+", parsed.path):
+        legacy_pattern = bool(re.search(r"/(?:novel/\d+/chapter|read/\d+)/\d+", parsed.path))
+        label = labels.get(link, "")
+        chapter_label = bool(re.search(r"(?:第[0-9一二三四五六七八九十百千]+[卷章回篇]|卷[上下中]|目录|目錄|下一[卷章回篇])", label))
+        chapter_path = bool(
+            re.search(r"(?:chapter|chap|juan|volume|read|text)[/_-]?\d+", parsed.path, re.I)
+            or re.search(r"(?:chapter|chap|juan|volume)(?:_?id)?=\d+", parsed.query, re.I)
+        )
+        if not legacy_pattern and not (chapter_label or chapter_path):
             continue
         clean_link = parsed._replace(query="mode=text" if "/read/" in parsed.path else "", fragment="").geturl()
         if clean_link not in seen:
             seen.add(clean_link)
-            chapter_links.append(clean_link)
+            (chapter_links if legacy_pattern else generic_links).append(clean_link)
+    if len(generic_links) >= 2:
+        chapter_links.extend(generic_links)
     if not chapter_links:
         return []
 
@@ -753,6 +973,33 @@ def fetch_chapter_units(base_url: str, html: str) -> list[SourceUnit]:
 
 def fetch_chapter_texts(base_url: str, html: str) -> str:
     return "\n\n".join(unit.text for unit in fetch_chapter_units(base_url, html) if unit.text.strip())
+
+
+def assess_source_units(units: list[SourceUnit]) -> dict:
+    texts = [unit.text.strip() for unit in units if unit.text.strip()]
+    total_chars = sum(len(text) for text in texts)
+    fingerprints = [hashlib.sha1(normalize_for_match(text)[0].encode("utf-8")).hexdigest() for text in texts]
+    duplicate_units = max(0, len(fingerprints) - len(set(fingerprints)))
+    suspicious_units = sum(1 for text in texts if source_text_looks_bad(text))
+    warnings = []
+    if not texts:
+        warnings.append("没有提取到可用正文")
+    elif total_chars < 1000:
+        warnings.append("提取文字过短，可能只是目录或说明页")
+    if len(units) == 1 and units[0].kind == "web":
+        warnings.append("只读取到当前网页，未发现可确认的章节链接")
+    if duplicate_units:
+        warnings.append(f"发现 {duplicate_units} 个重复内容单元")
+    if suspicious_units:
+        warnings.append(f"发现 {suspicious_units} 个疑似脚本或样式污染单元")
+    return {
+        "unitCount": len(units),
+        "totalChars": total_chars,
+        "duplicateUnits": duplicate_units,
+        "suspiciousUnits": suspicious_units,
+        "warnings": warnings,
+        "usable": bool(texts) and total_chars >= 200 and not suspicious_units,
+    }
 
 
 WIKISOURCE_API = "https://zh.wikisource.org/w/api.php"
@@ -932,6 +1179,24 @@ def exact_anchor_evidence(source_norm: str, anchor_text: str, side: str = "best"
     return best
 
 
+def anchor_present_in_source_corpus(source_corpus: str, anchor_text: str, side: str) -> bool:
+    if not source_corpus:
+        return False
+    lines = [normalize_for_match(line)[0] for line in re.split(r"[\r\n]+", anchor_text)]
+    lines = [line for line in lines if len(line) >= 6]
+    if not lines:
+        normalized, _ = normalize_for_match(anchor_text)
+        lines = [normalized] if len(normalized) >= 6 else []
+    for line in lines:
+        for size in (16, 12, 10, 8, 6):
+            if len(line) < size:
+                continue
+            needle = line[-size:] if side == "end" else line[:size]
+            if needle in source_corpus:
+                return True
+    return False
+
+
 def line_anchor_evidence(source_norm: str, anchor_text: str, side: str) -> tuple[int | None, int, str]:
     candidates = []
     for line in re.split(r"[\r\n]+", anchor_text):
@@ -970,13 +1235,27 @@ def strict_pair_in_text(source_text: str, start_text: str, end_text: str) -> dic
     if start_score < 44 or end_score < 44:
         return None
     end_boundary = end_pos + len(end_needle)
-    if end_boundary <= start_pos + 20 or end_boundary - start_pos > 1200:
+    if end_boundary <= start_pos or end_boundary - start_pos > 1200:
+        return None
+    refined_start = refine_boundary_from_recognized_edge(
+        source_text, mapping, start_pos, start_text, "start"
+    )
+    refined_end = refine_boundary_from_recognized_edge(
+        source_text, mapping, end_boundary, end_text, "end"
+    )
+    if refined_start is None or refined_end is None:
+        return None
+    start_pos, raw_start = refined_start
+    end_boundary, raw_end = refined_end
+    if end_boundary <= start_pos or end_boundary - start_pos > 1200 or raw_end <= raw_start:
         return None
     confidence = min(99, 75 + min(len(start_needle), len(end_needle)) * 2)
     return {
         "start": start_pos,
         "end": end_boundary,
-        "text": original_slice(source_text, mapping, start_pos, max(start_pos, end_boundary - 1)),
+        "rawStart": raw_start,
+        "rawEnd": raw_end,
+        "text": source_text[raw_start:raw_end].strip(),
         "confidence": confidence,
         "startNeedle": start_needle,
         "endNeedle": end_needle,
@@ -1007,6 +1286,8 @@ def discover_source_for_page(job: dict, start_text: str, end_text: str) -> Sourc
     existing_urls = {unit.url for unit in existing_units}
     for title in candidate_titles[:20]:
         book_units = fetch_wikisource_book_units(title)
+        if not assess_source_units(book_units)["usable"]:
+            continue
         matching = next((unit for unit in book_units if strict_pair_in_text(unit.text, start_text, end_text)), None)
         if matching:
             units = existing_units[:]
@@ -1213,29 +1494,80 @@ def stable_vertical_blocks(page_w: float, page_h: float, layout: str) -> tuple[l
     return blocks, (image_w, image_h)
 
 
-def render_page_image(pdf_path: Path, page_no: int, dpi: int = 140) -> Image.Image:
+def close_pdfium_documents() -> None:
+    for document in PDFIUM_DOCUMENTS.values():
+        try:
+            document.close()
+        except Exception:
+            pass
+    PDFIUM_DOCUMENTS.clear()
+
+
+atexit.register(close_pdfium_documents)
+
+
+def render_page_images_persistent(pdf_path: Path, page_numbers: list[int], dpi: int = 140) -> list[Image.Image]:
+    """Render with one persistent PDFium document per OCR worker process."""
+    if pdfium is None:
+        return render_page_images(pdf_path, page_numbers, dpi=dpi)
+    resolved = pdf_path.resolve()
+    stat = resolved.stat()
+    key = (str(resolved), stat.st_size, stat.st_mtime_ns)
+    document = PDFIUM_DOCUMENTS.get(key)
+    if document is None:
+        close_pdfium_documents()
+        document = pdfium.PdfDocument(str(resolved))
+        PDFIUM_DOCUMENTS[key] = document
+    images = []
+    for page_no in page_numbers:
+        page = document[page_no - 1]
+        bitmap = None
+        try:
+            bitmap = page.render(scale=dpi / 72.0)
+            images.append(bitmap.to_pil().convert("RGB").copy())
+        finally:
+            if bitmap is not None:
+                bitmap.close()
+            page.close()
+    return images
+
+
+def render_page_images(pdf_path: Path, page_numbers: list[int], dpi: int = 140) -> list[Image.Image]:
+    if not page_numbers:
+        return []
+    if page_numbers != list(range(page_numbers[0], page_numbers[-1] + 1)):
+        raise ValueError("批量渲染只接受连续页。")
     if not POPPLER.exists():
         raise FileNotFoundError(f"Poppler renderer not found: {POPPLER}")
     identity = hashlib.sha1(str(pdf_path.resolve()).encode("utf-8", errors="ignore")).hexdigest()[:8]
-    out_prefix = pdf_path.parent / f".render-page-{page_no:04d}-{identity}-{os.getpid()}-{threading.get_ident()}"
-    result = subprocess.run(
-        [str(POPPLER), "-f", str(page_no), "-l", str(page_no), "-png", "-r", str(dpi), str(pdf_path), str(out_prefix)],
-        check=False,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    if result.returncode != 0:
-        detail = result.stderr.decode("utf-8", errors="ignore").strip() or "页面渲染器没有返回可用信息。"
-        raise RuntimeError(f"第 {page_no} 页没有渲染成功：{detail}")
-    candidates = sorted(out_prefix.parent.glob(f"{out_prefix.name}-*.png"), key=lambda path: path.stat().st_mtime, reverse=True)
-    if not candidates:
-        raise FileNotFoundError(f"第 {page_no} 页没有生成预览图，请换一页试试。")
-    rendered = candidates[0]
-    with Image.open(rendered) as opened:
-        image = opened.convert("RGB")
-    for candidate in candidates:
-        candidate.unlink(missing_ok=True)
-    return image
+    first_page, last_page = page_numbers[0], page_numbers[-1]
+    out_prefix = pdf_path.parent / f".render-pages-{first_page:04d}-{last_page:04d}-{identity}-{os.getpid()}-{threading.get_ident()}"
+    candidates = []
+    try:
+        result = subprocess.run(
+            [str(POPPLER), "-f", str(first_page), "-l", str(last_page), "-png", "-r", str(dpi), str(pdf_path), str(out_prefix)],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        if result.returncode != 0:
+            detail = result.stderr.decode("utf-8", errors="ignore").strip() or "页面渲染器没有返回可用信息。"
+            raise RuntimeError(f"第 {first_page}-{last_page} 页没有渲染成功：{detail}")
+        candidates = sorted(out_prefix.parent.glob(f"{out_prefix.name}-*.png"))
+        if len(candidates) != len(page_numbers):
+            raise FileNotFoundError(f"第 {first_page}-{last_page} 页渲染数量不完整。")
+        images = []
+        for rendered in candidates:
+            with Image.open(rendered) as opened:
+                images.append(opened.convert("RGB"))
+        return images
+    finally:
+        for candidate in candidates or out_prefix.parent.glob(f"{out_prefix.name}-*.png"):
+            candidate.unlink(missing_ok=True)
+
+
+def render_page_image(pdf_path: Path, page_no: int, dpi: int = 140) -> Image.Image:
+    return render_page_images(pdf_path, [page_no], dpi=dpi)[0]
 
 
 def draw_guides(image: Image.Image, blocks: list[dict], out_path: Path) -> None:
@@ -1255,237 +1587,102 @@ def remove_text(page, pdf_context) -> None:
     if contents is None:
         return
     stream = ContentStream(contents, pdf_context)
-    kept = []
-    depth = 0
-    for operands, operator in stream.operations:
-        if operator == b"BT":
-            depth += 1
-            continue
-        if operator == b"ET":
-            depth = max(0, depth - 1)
-            continue
-        if depth == 0:
-            kept.append((operands, operator))
-    stream.operations = kept
+    text_showing_operators = {b"Tj", b"TJ", b"'", b'"'}
+    stream.operations = [
+        (operands, operator)
+        for operands, operator in stream.operations
+        if operator not in text_showing_operators
+    ]
     page.replace_contents(stream)
 
 
-def proportional_capacities(raw: list[float], total: int) -> list[int]:
-    if not raw or total <= 0:
-        return []
-    scale = total / max(1.0, sum(raw))
-    exact = [max(1.0, value * scale) for value in raw]
-    capacities = [max(1, int(value)) for value in exact]
-    remainder = total - sum(capacities)
-    order = sorted(range(len(exact)), key=lambda index: exact[index] - int(exact[index]), reverse=remainder > 0)
-    cursor = 0
-    while remainder and order:
-        index = order[cursor % len(order)]
-        if remainder > 0:
-            capacities[index] += 1
-            remainder -= 1
-        elif capacities[index] > 1:
-            capacities[index] -= 1
-            remainder += 1
-        cursor += 1
-        if cursor > len(order) * max(2, total):
-            break
-    return capacities
-
-
 def draw_vertical_text(pdf_canvas, text: str, blocks: list[dict], page_w: float, page_h: float, image_w: int, image_h: int) -> None:
-    chars = [char for char in text if not char.isspace()]
-    if not chars:
-        return
-    sx, sy = page_w / image_w, page_h / image_h
-    columns = []
-    for block in blocks:
-        geometry = block.get("ocrColumns") or []
-        if geometry:
-            columns.extend(geometry)
-            continue
-        _, iy0, _, iy1 = block["inner"]
-        columns.extend({"x": x, "y0": iy0, "y1": iy1, "recognized": ""} for x in block["cols"])
-    if not columns:
-        return
-    pitch_samples = []
-    for column in columns:
-        recognized = [char for char in str(column.get("recognized") or "") if not char.isspace()]
-        height = max(1.0, float(column["y1"]) - float(column["y0"]))
-        if len(recognized) >= 6:
-            pitch_samples.append(height / len(recognized))
-    pitch_samples.sort()
-    pitch = pitch_samples[len(pitch_samples) // 2] if pitch_samples else max(8.0, image_h * 0.019)
-    plausible = [value for value in pitch_samples if pitch * 0.55 <= value <= pitch * 1.8]
-    if plausible:
-        plausible.sort()
-        pitch = plausible[len(plausible) // 2]
-    raw_capacities = [max(1.0, (float(column["y1"]) - float(column["y0"])) / max(1.0, pitch)) for column in columns]
-    capacities = proportional_capacities(raw_capacities, len(chars))
-    index = 0
-    for column, capacity in zip(columns, capacities):
-        if index >= len(chars):
-            return
-        y0 = float(column["y0"])
-        y1 = float(column["y1"])
-        usable_h = (y1 - y0) * sy
-        step = usable_h / max(1, capacity)
-        font_size = min(10.5, max(5.0, step * 0.88))
-        x = float(column["x"]) * sx - font_size * .35
-        y_start = page_h - y0 * sy - font_size
-        chunk = chars[index:index + capacity]
-        index += capacity
-        for offset, char in enumerate(chunk):
-            text_obj = pdf_canvas.beginText()
-            text_obj.setTextRenderMode(3)
-            text_obj.setFont(ensure_char_font(char), font_size)
-            text_obj.setTextOrigin(x, y_start - offset * step)
-            text_obj.textOut(char)
-            pdf_canvas.drawText(text_obj)
+    draw_word_style_authoritative_text(pdf_canvas, text, page_w, page_h, "vertical-single")
 
 
 def draw_horizontal_text(pdf_canvas, text: str, page_w: float, page_h: float) -> None:
-    chars = [char for char in text if not char.isspace()]
-    if not chars:
-        return
-    margin_x = max(24.0, page_w * 0.075)
-    margin_y = max(24.0, page_h * 0.075)
-    usable_w = max(40.0, page_w - margin_x * 2)
-    usable_h = max(40.0, page_h - margin_y * 2)
-    font_size = 10.0
-    while font_size > 4.0:
-        chars_per_line = max(1, int(usable_w / font_size))
-        line_count = (len(chars) + chars_per_line - 1) // chars_per_line
-        if line_count * font_size * 1.35 <= usable_h:
-            break
-        font_size -= 0.5
-    chars_per_line = max(1, int(usable_w / font_size))
-    line_step = font_size * 1.35
-    for line_index, start in enumerate(range(0, len(chars), chars_per_line)):
-        y = page_h - margin_y - font_size - line_index * line_step
-        if y < margin_y - font_size:
-            raise ValueError("本页文字超过横排版心容量，已停止生成，避免截断文字。")
-        text_obj = pdf_canvas.beginText(margin_x, y)
-        text_obj.setTextRenderMode(3)
-        for char in chars[start:start + chars_per_line]:
-            text_obj.setFont(ensure_char_font(char), font_size)
-            text_obj.textOut(char)
-        pdf_canvas.drawText(text_obj)
+    draw_word_style_authoritative_text(pdf_canvas, text, page_w, page_h, "horizontal")
 
 
-def searchable_safe_text(text: str) -> str:
-    for source_variant, safe_variant in COMMON_GLYPH_VARIANTS.items():
-        text = text.replace(source_variant, safe_variant)
-    return "".join(
-        char
-        for char in text
-        if char != "\x00" and not ("\ue000" <= char <= "\uf8ff")
-    )
+def canonical_output_text(text: str) -> str:
+    return "".join(char for char in text if char != "\x00" and not char.isspace())
 
 
-def search_aliases(text: str) -> list[str]:
-    text = searchable_safe_text(text)
-    plain = "".join(char for char in text if not char.isspace() and char not in SKIP_CHARS)
-    if not plain:
-        return []
-    script = detect_cjk_script(plain)
-    configs = ("t2s",) if script == "traditional" else (("s2t",) if script == "simplified" else ("t2s", "s2t"))
-    candidates = [plain]
-    for config in configs:
-        converter = opencc_converter(config)
-        if converter:
-            candidates.append(converter.convert(plain))
-    aliases = []
-    seen = set()
-    for candidate in candidates:
-        candidate = "".join(char for char in candidate if not char.isspace() and char not in SKIP_CHARS)
-        if candidate and candidate not in seen:
-            seen.add(candidate)
-            aliases.append(candidate)
-    return aliases
+def word_frame_font_size(char_count: int, usable_w: float, usable_h: float, initial: float = 12.0) -> float:
+    if char_count <= 0:
+        return initial
 
+    def capacity(font_size: float) -> int:
+        return max(1, int(usable_w / font_size)) * max(1, int(usable_h / font_size))
 
-def search_alias_fragments(text: str, window: int = 48, stride: int = 24) -> list[tuple[int, int, str]]:
-    fragments = []
-    for alias_index, alias in enumerate(search_aliases(text)):
-        if len(alias) <= window:
-            starts = [0]
+    if capacity(initial) >= char_count:
+        return initial
+    low = min(0.1, max(0.001, (usable_w * usable_h / char_count) ** 0.5 * 0.1))
+    high = initial
+    for _ in range(48):
+        middle = (low + high) / 2
+        if capacity(middle) >= char_count:
+            low = middle
         else:
-            starts = list(range(0, len(alias) - window + 1, stride))
-            tail = len(alias) - window
-            if starts[-1] != tail:
-                starts.append(tail)
-        fragments.extend((alias_index, start, alias[start:start + window]) for start in starts)
-    return fragments
+            high = middle
+    return max(0.001, low * 0.999)
 
 
-def draw_search_aliases(
+def pdf_actual_text_hex(text: str) -> str:
+    return (b"\xfe\xff" + text.encode("utf-16-be", errors="surrogatepass")).hex().upper()
+
+
+def draw_word_style_authoritative_text(
     pdf_canvas,
     text: str,
-    blocks: list[dict] | None = None,
-    image_size: tuple[int, int] | None = None,
-) -> None:
-    page_w, page_h = pdf_canvas._pagesize
-    font_size = 7.0
-    aliases = search_aliases(text)
-    columns = []
-    if blocks and image_size:
-        for block in blocks:
-            _, y0, _, y1 = block["inner"]
-            columns.extend({"x": x, "y0": y0, "y1": y1} for x in block.get("cols", []))
-    sx = float(page_w) / image_size[0] if image_size else 1.0
-    sy = float(page_h) / image_size[1] if image_size else 1.0
-    column_pitch = 36.0
-    if len(columns) >= 2:
-        deltas = sorted(abs(float(columns[index]["x"]) - float(columns[index - 1]["x"])) for index in range(1, len(columns)))
-        column_pitch = deltas[len(deltas) // 2] * sx
+    page_w: float,
+    page_h: float,
+    layout: str,
+) -> dict:
+    """Place exact source text in an independent 3 cm Word-style page frame."""
+    chars = canonical_output_text(text)
+    if not chars:
+        return {"fontSize": 12.0, "columns": 0, "rows": 0}
+    requested_margin = 3.0 * 72.0 / 2.54
+    margin_x = min(requested_margin, max(0.0, page_w / 2 - 0.001))
+    margin_y = min(requested_margin, max(0.0, page_h / 2 - 0.001))
+    usable_w = max(0.001, page_w - margin_x * 2)
+    usable_h = max(0.001, page_h - margin_y * 2)
+    font_size = word_frame_font_size(len(chars), usable_w, usable_h)
+    cells_across = max(1, int(usable_w / font_size))
+    cells_down = max(1, int(usable_h / font_size))
+    vertical = layout != "horizontal"
 
-    for alias_index, start, fragment in search_alias_fragments(text):
-        alias = aliases[alias_index]
-        if columns:
-            chars_per_column = max(1, (len(alias) + len(columns) - 1) // len(columns))
-            column = columns[min(len(columns) - 1, start // chars_per_column)]
-            row_fraction = min(1.0, (start % chars_per_column) / chars_per_column)
-            target_width = max(30.0, column_pitch * 2.2)
-            x = max(8.0, min(float(page_w) - target_width - 8.0, float(column["x"]) * sx - target_width / 2))
-            image_y = float(column["y0"]) + row_fraction * (float(column["y1"]) - float(column["y0"]))
-            y = max(8.0, min(float(page_h) - 10.0, float(page_h) - image_y * sy - alias_index * 3.0))
-        else:
-            target_width = max(50.0, float(page_w) * .72)
-            x = max(8.0, (float(page_w) - target_width) / 2)
-            y_fraction = start / max(1, len(alias))
-            y = max(12.0, float(page_h) * (.84 - y_fraction * .68) - alias_index * 4.0)
-
-        unscaled_width = 0.0
-        for char in fragment:
-            font = ensure_char_font(char)
-            unscaled_width += pdfmetrics.stringWidth(char, font, font_size)
-        horizontal_scale = min(100.0, target_width * 100.0 / max(1.0, unscaled_width))
-        text_obj = pdf_canvas.beginText(x, y)
-        text_obj.setTextRenderMode(3)
-        text_obj.setHorizScale(horizontal_scale)
-        current_font = ""
-        run = []
-        for char in fragment:
-            font = ensure_char_font(char)
-            if current_font and font != current_font:
-                text_obj.setFont(current_font, font_size)
-                text_obj.textOut("".join(run))
-                run = []
+    pdf_canvas._code.append(f"/Span << /ActualText <{pdf_actual_text_hex(chars)}> >> BDC")
+    text_obj = pdf_canvas.beginText()
+    text_obj.setTextRenderMode(3)
+    current_font = ""
+    for index, char in enumerate(chars):
+        font = ensure_char_font(char)
+        if font != current_font:
+            text_obj.setFont(font, font_size)
             current_font = font
-            run.append(char)
-        if run:
-            text_obj.setFont(current_font, font_size)
-            text_obj.textOut("".join(run))
-        pdf_canvas.drawText(text_obj)
+        if vertical:
+            column = index // cells_down
+            row = index % cells_down
+            x = page_w - margin_x - font_size - column * font_size
+            y = page_h - margin_y - font_size - row * font_size
+        else:
+            row = index // cells_across
+            column = index % cells_across
+            x = margin_x + column * font_size
+            y = page_h - margin_y - font_size - row * font_size
+        text_obj.setTextOrigin(x, y)
+        text_obj.textOut(char)
+    pdf_canvas.drawText(text_obj)
+    pdf_canvas._code.append("EMC")
+    columns = (len(chars) + cells_down - 1) // cells_down if vertical else cells_across
+    rows = cells_down if vertical else (len(chars) + cells_across - 1) // cells_across
+    return {"fontSize": round(font_size, 3), "columns": columns, "rows": rows}
 
 
 def expected_text_layer_norm(text: str) -> str:
-    primary, _ = normalize_for_match(searchable_safe_text(text))
-    if not SEARCH_ALIASES_ENABLED:
-        return primary
-    alias_norm = "".join(normalize_for_match(fragment)[0] for _, _, fragment in search_alias_fragments(text))
-    return primary + alias_norm
+    return canonical_output_text(text)
 
 
 def page_text_from_sources(job: dict, page_no: int, layout: str | None = None, require_anchor_for_scan: bool = True) -> str:
@@ -1541,6 +1738,140 @@ def normalize_source_cached(text: str) -> tuple[str, list[int]]:
             NORMALIZED_SOURCE_CACHE.clear()
         NORMALIZED_SOURCE_CACHE[key] = (text, normalized, mapping)
     return normalized, mapping
+
+
+def normalize_edge_literal(text: str) -> tuple[str, list[int]]:
+    chars = []
+    mapping = []
+    for index, char in enumerate(text):
+        if char.isspace():
+            continue
+        chars.append(char if char in SKIP_CHARS else normalize_cjk_variant(char))
+        mapping.append(index)
+    return "".join(chars), mapping
+
+
+def recognized_edge_literal(anchor_text: str, side: str, size: int = 12) -> str:
+    lines = [line for line in re.split(r"[\r\n]+", anchor_text) if line.strip()]
+    if not lines:
+        return ""
+    literal, _ = normalize_edge_literal("".join(lines))
+    if side == "end":
+        return literal[-size:]
+    return literal[:size]
+
+
+def refine_boundary_from_recognized_edge(
+    source_text: str,
+    mapping: list[int],
+    strong_boundary: int,
+    anchor_text: str,
+    side: str,
+) -> tuple[int, int] | None:
+    """Return normalized/raw boundary only when the literal page edge is unique nearby."""
+    literal = recognized_edge_literal(anchor_text, side)
+    if not literal or not mapping:
+        return None
+    source_edge, edge_mapping = normalize_edge_literal(source_text)
+    if not source_edge or not edge_mapping:
+        return None
+    strong_index = max(0, min(strong_boundary, len(mapping) - 1))
+    strong_raw = mapping[strong_index]
+    edge_cursor = bisect.bisect_left(edge_mapping, strong_raw)
+    if side == "start":
+        low = max(0, edge_cursor - 180)
+        high = min(len(source_edge), edge_cursor + 20)
+    else:
+        low = max(0, edge_cursor - 20)
+        high = min(len(source_edge), edge_cursor + 180)
+    positions = []
+    cursor = low
+    while len(positions) < 2:
+        found = source_edge.find(literal, cursor, high)
+        if found < 0:
+            break
+        positions.append(found)
+        cursor = found + 1
+    if len(positions) == 1:
+        found = positions[0]
+        if side == "start":
+            raw_boundary = edge_mapping[found]
+            normalized_boundary = bisect.bisect_left(mapping, raw_boundary)
+        else:
+            raw_boundary = edge_mapping[found + len(literal) - 1] + 1
+            normalized_boundary = bisect.bisect_left(mapping, raw_boundary)
+        return normalized_boundary, raw_boundary
+
+    # OCR often omits punctuation inside an otherwise unique edge phrase. Keep
+    # an explicitly recognized outer punctuation literal strict, but allow the
+    # already unique normalized anchor to define the same character boundary.
+    source_norm, _ = normalize_for_match(source_text)
+    anchor_pos, anchor_score, anchor_needle = line_anchor_evidence(source_norm, anchor_text, side)
+    if anchor_pos is None or anchor_score < 44 or not anchor_needle:
+        return None
+    normalized_boundary = anchor_pos if side == "start" else anchor_pos + len(anchor_needle)
+    if normalized_boundary != strong_boundary:
+        return None
+    if side == "start":
+        raw_boundary = mapping[normalized_boundary]
+    else:
+        raw_boundary = mapping[normalized_boundary - 1] + 1
+    outer_char = literal[0] if side == "start" else literal[-1]
+    if outer_char in SKIP_CHARS or unicodedata.category(outer_char)[:1] in {"P", "S"}:
+        if side == "start":
+            if raw_boundary > 0 and source_text[raw_boundary - 1] == outer_char:
+                raw_boundary -= 1
+            elif source_text[raw_boundary:raw_boundary + 1] != outer_char:
+                return None
+        else:
+            if source_text[raw_boundary:raw_boundary + 1] == outer_char:
+                raw_boundary += 1
+            elif source_text[raw_boundary - 1:raw_boundary] != outer_char:
+                return None
+    return normalized_boundary, raw_boundary
+
+
+def strict_page_slice_from_edges(
+    source_text: str,
+    mapping: list[int],
+    start: int,
+    end: int,
+    start_anchor: str,
+    end_anchor: str,
+) -> dict | None:
+    refined_start = refine_boundary_from_recognized_edge(
+        source_text, mapping, start, start_anchor, "start"
+    )
+    refined_end = refine_boundary_from_recognized_edge(
+        source_text, mapping, end, end_anchor, "end"
+    )
+    if refined_start is None or refined_end is None:
+        return None
+    normalized_start, raw_start = refined_start
+    normalized_end, raw_end = refined_end
+    if normalized_start != start or normalized_end != end or raw_end <= raw_start:
+        return None
+    return {
+        "start": normalized_start,
+        "end": normalized_end,
+        "rawStart": raw_start,
+        "rawEnd": raw_end,
+        "text": source_text[raw_start:raw_end].strip(),
+    }
+
+
+def strict_page_text_from_edges(
+    source_text: str,
+    mapping: list[int],
+    start: int,
+    end: int,
+    start_anchor: str,
+    end_anchor: str,
+) -> str | None:
+    page_slice = strict_page_slice_from_edges(
+        source_text, mapping, start, end, start_anchor, end_anchor
+    )
+    return str(page_slice["text"]) if page_slice else None
 
 
 def anchor_from_text(text: str, side: str, size: int = 18) -> str:
@@ -1699,13 +2030,11 @@ def sort_ocr_items(boxes, txts, scores, layout: str) -> list[str]:
     return [item["text"] for item in items]
 
 
-def ocr_image_text(image: Image.Image, image_path: Path, layout: str) -> str:
+def ocr_image_text(image: Image.Image, layout: str) -> str:
     engine = get_ocr_engine()
     if engine is None:
         return ""
-    image.save(image_path)
-    result = engine(str(image_path))
-    image_path.unlink(missing_ok=True)
+    result = engine(image)
     return clean_ocr_text("\n".join(sort_ocr_items(result.boxes, result.txts, result.scores, layout)))
 
 
@@ -1725,10 +2054,7 @@ def attach_ocr_column_geometry(job: dict, page_no: int, image: Image.Image, bloc
         engine = get_ocr_engine()
         if engine is None:
             return blocks
-        image_path = cache_path.with_suffix(".png")
-        image.save(image_path)
-        result = engine(str(image_path))
-        image_path.unlink(missing_ok=True)
+        result = engine(image)
         items = []
         boxes = [] if result.boxes is None else result.boxes
         txts = [] if result.txts is None else result.txts
@@ -1831,23 +2157,39 @@ def attach_ocr_column_geometry(job: dict, page_no: int, image: Image.Image, bloc
     return blocks
 
 
-def ocr_anchor_images(crops: list[Image.Image], image_path: Path, layout: str) -> list[str]:
+def ocr_grouped_images(crops: list[Image.Image], layout: str) -> list[str]:
     if not crops:
-        return ["", ""]
+        return []
     engine = get_ocr_engine()
     if engine is None:
-        return ["", ""]
+        return ["" for _ in crops]
     gap = 36
-    widths = [crop.width for crop in crops[:2]]
-    height = max(crop.height for crop in crops[:2])
-    combined = Image.new("RGB", (sum(widths) + gap, height), "white")
-    offsets = [0, widths[0] + gap]
-    for index, crop in enumerate(crops[:2]):
-        combined.paste(crop, (offsets[index], 0))
-    combined.save(image_path)
-    result = engine(str(image_path))
-    image_path.unlink(missing_ok=True)
-    groups = [[], []]
+    column_count = min(2, len(crops))
+    row_count = math.ceil(len(crops) / column_count)
+    column_widths = [
+        max(crops[index].width for index in range(column, len(crops), column_count))
+        for column in range(column_count)
+    ]
+    row_heights = [
+        max(crops[index].height for index in range(row * column_count, min(len(crops), (row + 1) * column_count)))
+        for row in range(row_count)
+    ]
+    x_offsets = [sum(column_widths[:column]) + gap * column for column in range(column_count)]
+    y_offsets = [sum(row_heights[:row]) + gap * row for row in range(row_count)]
+    combined = Image.new(
+        "RGB",
+        (sum(column_widths) + gap * (column_count - 1), sum(row_heights) + gap * (row_count - 1)),
+        "white",
+    )
+    crop_rects = []
+    for index, crop in enumerate(crops):
+        column = index % column_count
+        row = index // column_count
+        x0, y0 = x_offsets[column], y_offsets[row]
+        combined.paste(crop, (x0, y0))
+        crop_rects.append((x0, y0, x0 + crop.width, y0 + crop.height))
+    result = engine(combined)
+    groups = [[] for _ in crops]
     boxes = [] if result.boxes is None else result.boxes
     txts = [] if result.txts is None else result.txts
     scores = [] if result.scores is None else result.scores
@@ -1858,9 +2200,15 @@ def ocr_anchor_images(crops: list[Image.Image], image_path: Path, layout: str) -
         points = [[float(value) for value in point] for point in box]
         cx = sum(point[0] for point in points) / max(1, len(points))
         cy = sum(point[1] for point in points) / max(1, len(points))
-        group_index = 0 if cx < widths[0] + gap / 2 else 1
-        local_cx = cx - offsets[group_index]
-        groups[group_index].append({"text": text, "cx": local_cx, "cy": cy})
+        group_index = None
+        for candidate, (x0, y0, x1, y1) in enumerate(crop_rects):
+            if x0 - gap / 2 <= cx <= x1 + gap / 2 and y0 - gap / 2 <= cy <= y1 + gap / 2:
+                group_index = candidate
+                break
+        if group_index is None:
+            continue
+        x0, y0, _, _ = crop_rects[group_index]
+        groups[group_index].append({"text": text, "cx": cx - x0, "cy": cy - y0})
     texts = []
     for items in groups:
         if layout.startswith("vertical"):
@@ -1891,7 +2239,13 @@ def text_column_runs(image: Image.Image, inner: tuple[int, int, int, int]) -> li
     return found
 
 
-def ocr_anchor_crops(image: Image.Image, layout: str, units: int = 1) -> list[Image.Image]:
+def ocr_anchor_crops(
+    image: Image.Image,
+    layout: str,
+    units: int = 1,
+    blocks: list[dict] | None = None,
+    edge_runs: tuple[list[tuple[int, int]], list[tuple[int, int]]] | None = None,
+) -> list[Image.Image]:
     def valid_box(x0: int, y0: int, x1: int, y1: int) -> tuple[int, int, int, int]:
         left, right = sorted((max(0, min(image.width - 1, x0)), max(1, min(image.width, x1))))
         top, bottom = sorted((max(0, min(image.height - 1, y0)), max(1, min(image.height, y1))))
@@ -1910,22 +2264,26 @@ def ocr_anchor_crops(image: Image.Image, layout: str, units: int = 1) -> list[Im
             image.crop((ix0, max(iy0, iy1 - line_height), ix1, iy1)),
         ]
 
-    blocks = detect_vertical_blocks(image, layout)
+    blocks = blocks if blocks is not None else detect_vertical_blocks(image, layout)
     if not blocks:
         return [image]
     start_block = blocks[0]
     end_block = blocks[-1]
     six0, siy0, six1, siy1 = start_block["inner"]
     eix0, eiy0, eix1, eiy1 = end_block["inner"]
-    start_runs = text_column_runs(image, start_block["inner"])
-    end_runs = text_column_runs(image, end_block["inner"])
+    if edge_runs is None:
+        start_runs = text_column_runs(image, start_block["inner"])
+        end_runs = text_column_runs(image, end_block["inner"])
+    else:
+        start_runs, end_runs = edge_runs
     start_col = start_runs[-1] if start_runs else (six1 - 70, six1)
     end_col = end_runs[0] if end_runs else (eix0, eix0 + 70)
     start_width = max(80, min(190, (start_col[1] - start_col[0]) * units + 34))
     end_width = max(80, min(190, (end_col[1] - end_col[0]) * units + 34))
     start_right = min(six1, max(six0 + 1, start_col[1] + 8))
     start_left = max(six0, min(start_right - 1, start_col[1] - start_width))
-    end_left = max(eix0, min(eix1 - 1, end_col[0] - 8))
+    edge_pad = max(40, round(image.width * 0.10))
+    end_left = max(0, min(eix1 - 1, end_col[0] - edge_pad))
     end_right = min(eix1, max(end_left + 1, end_col[0] + end_width))
     return [
         image.crop(valid_box(start_left, siy0 - 70, start_right, siy1 + 35)),
@@ -1933,65 +2291,146 @@ def ocr_anchor_crops(image: Image.Image, layout: str, units: int = 1) -> list[Im
     ]
 
 
-def ocr_page_anchor_pair(job: dict, page_no: int, layout: str) -> tuple[str, str]:
+def ocr_page_anchor_pair(
+    job: dict,
+    page_no: int,
+    layout: str,
+    rendered_image: Image.Image | None = None,
+    render_dpi: int = 140,
+) -> tuple[str, str]:
     job_id = str(job.get("id") or "").strip()
     paths = job_paths(job_id) if job_id else None
-    cache_path = (paths.root / f"page-{page_no:04d}-ocr-anchors-v8.json") if paths else Path(job["pdf"]).parent / f"page-{page_no:04d}-ocr-anchors-v8.json"
+    cache_name = f"page-{page_no:04d}-ocr-anchors-v{ANCHOR_CACHE_VERSION}.json"
+    cache_path = (paths.root / cache_name) if paths else Path(job["pdf"]).parent / cache_name
     if cache_path.exists():
         try:
             payload = json.loads(cache_path.read_text(encoding="utf-8"))
             start_text = str(payload.get("start") or "")
             end_text = str(payload.get("end") or "")
-            if payload.get("complete") or start_text or end_text:
+            if (
+                payload.get("layout") == layout
+                and payload.get("inputFingerprint", "") == str(job.get("inputFingerprint") or "")
+                and (payload.get("complete") or start_text or end_text)
+            ):
                 return start_text, end_text
         except Exception:
             pass
-    image = render_page_image(Path(job["pdf"]), page_no, dpi=140)
-    primary_crops = ocr_anchor_crops(image, layout, units=1)
-    expanded_crops = ocr_anchor_crops(image, layout, units=2)
-    chunks = ocr_anchor_images(primary_crops[:2], cache_path.with_suffix(".crops.png"), layout)
-    for index, text in enumerate(chunks[:2], 1):
+    legacy_start = ""
+    if ANCHOR_CACHE_VERSION in {9, 10} and str(job.get("layout") or "") == layout:
+        legacy_path = cache_path.with_name(f"page-{page_no:04d}-ocr-anchors-v8.json")
+        if legacy_path.exists():
+            try:
+                legacy_payload = json.loads(legacy_path.read_text(encoding="utf-8"))
+                legacy_start = str(legacy_payload.get("start") or "")
+            except (OSError, json.JSONDecodeError):
+                pass
+    image = rendered_image if rendered_image is not None else render_page_image(Path(job["pdf"]), page_no, dpi=140)
+    detected_blocks = detect_horizontal_block(image) if layout == "horizontal" else detect_vertical_blocks(image, layout)
+    edge_runs = None
+    if layout != "horizontal" and detected_blocks:
+        edge_runs = (
+            text_column_runs(image, detected_blocks[0]["inner"]),
+            text_column_runs(image, detected_blocks[-1]["inner"]),
+        )
+    primary_crops = ocr_anchor_crops(image, layout, units=1, blocks=detected_blocks, edge_runs=edge_runs)
+    expanded_crops = ocr_anchor_crops(image, layout, units=2, blocks=detected_blocks, edge_runs=edge_runs)
+    if legacy_start and len(primary_crops) >= 2:
+        end_variants = ocr_grouped_images([primary_crops[1], expanded_crops[1]], layout)
+        chunks = [legacy_start, end_variants[0] if end_variants else ""]
+        expanded_texts = {2: end_variants[1] if len(end_variants) > 1 else ""}
+        indexes = (2,)
+    else:
+        batched = ocr_grouped_images([*primary_crops[:2], *expanded_crops[:2]], layout)
+        chunks = batched[:2]
+        expanded_texts = {
+            1: batched[2] if len(batched) > 2 else "",
+            2: batched[3] if len(batched) > 3 else "",
+        }
+        indexes = tuple(range(1, min(2, len(chunks)) + 1))
+    source_corpus = source_search_corpus(job)
+    for index in indexes:
+        text = chunks[index - 1]
         normalized, _ = normalize_for_match(text)
         side = "start" if index == 1 else "end"
-        source_match = any(
-            exact_anchor_evidence(normalize_for_match(unit.text)[0], text, side)[0] is not None
-            for unit in load_source_units(job)
-        )
-        if (len(normalized) < 4 or not source_match) and index - 1 < len(expanded_crops):
-            text = ocr_image_text(expanded_crops[index - 1], cache_path.with_suffix(f".crop-{index}-wide.png"), layout)
-            chunks[index - 1] = text
+        source_match = anchor_present_in_source_corpus(source_corpus, text, side)
+        if len(normalized) < 4 or not source_match:
+            chunks[index - 1] = expanded_texts.get(index) or text
     while len(chunks) < 2:
         chunks.append("")
     cache_path.parent.mkdir(parents=True, exist_ok=True)
-    detected_blocks = detect_horizontal_block(image) if layout == "horizontal" else detect_vertical_blocks(image, layout)
     atomic_write_json(cache_path, {
         "complete": True,
         "start": chunks[0],
         "end": chunks[1],
         "imageSize": list(image.size),
         "blocks": detected_blocks,
+        "reusedV8Start": bool(legacy_start),
+        "layout": layout,
+        "inputFingerprint": str(job.get("inputFingerprint") or ""),
+        "renderer": "pdfium-persistent" if rendered_image is not None and pdfium is not None else "poppler",
+        "renderDpi": render_dpi,
     })
     return chunks[0], chunks[1]
 
 
-def precompute_anchor_worker(payload: tuple[str, int, str]) -> tuple[int, bool, str]:
-    job_id, page_no, layout = payload
+def source_search_corpus(job: dict) -> str:
+    corpus_key = str(job.get("inputFingerprint") or job.get("id") or job.get("sourceText") or "")
+    source_corpus = SOURCE_SEARCH_CORPUS_CACHE.get(corpus_key)
+    if source_corpus is None:
+        source_corpus = "\n".join(normalize_source_cached(unit.text)[0] for unit in load_source_units(job))
+        if len(SOURCE_SEARCH_CORPUS_CACHE) >= 4:
+            SOURCE_SEARCH_CORPUS_CACHE.clear()
+        SOURCE_SEARCH_CORPUS_CACHE[corpus_key] = source_corpus
+    return source_corpus
+
+
+def anchor_pair_strong_for_source(job: dict, start_text: str, end_text: str) -> bool:
+    corpus = source_search_corpus(job)
+    evidence = []
+    for side, text in (("start", start_text), ("end", end_text)):
+        normalized, _ = normalize_for_match(text)
+        evidence.append(len(normalized) >= 8 and anchor_present_in_source_corpus(corpus, text, side))
+    return all(evidence)
+
+
+def precompute_anchor_worker(payload: tuple[str, tuple[int, ...], str]) -> list[tuple[int, bool, str]]:
+    job_id, page_numbers, layout = payload
     try:
         paths = job_paths(job_id)
         job = json.loads(paths.meta.read_text(encoding="utf-8"))
-        start_text, end_text = ocr_page_anchor_pair(job, page_no, layout)
-        return page_no, bool(start_text or end_text), ""
+        images = render_page_images_persistent(Path(job["pdf"]), list(page_numbers), dpi=120)
     except Exception as error:
-        return page_no, False, str(error)
+        return [(page_no, False, str(error)) for page_no in page_numbers]
+    results = []
+    for page_no, image in zip(page_numbers, images):
+        try:
+            start_text, end_text = ocr_page_anchor_pair(
+                job, page_no, layout, rendered_image=image, render_dpi=120
+            )
+            if not anchor_pair_strong_for_source(job, start_text, end_text):
+                cache_path = job_paths(job_id).root / f"page-{page_no:04d}-ocr-anchors-v{ANCHOR_CACHE_VERSION}.json"
+                cache_path.unlink(missing_ok=True)
+                high_image = render_page_images_persistent(Path(job["pdf"]), [page_no], dpi=140)[0]
+                start_text, end_text = ocr_page_anchor_pair(
+                    job, page_no, layout, rendered_image=high_image, render_dpi=140
+                )
+            results.append((page_no, bool(start_text or end_text), ""))
+        except Exception as error:
+            results.append((page_no, False, str(error)))
+    return results
 
 
-def anchor_cache_ready(job_id: str, page_no: int) -> bool:
-    cache_path = job_paths(job_id).root / f"page-{page_no:04d}-ocr-anchors-v8.json"
+def anchor_cache_ready(job_id: str, page_no: int, layout: str, input_fingerprint: str = "") -> bool:
+    cache_path = job_paths(job_id).root / f"page-{page_no:04d}-ocr-anchors-v{ANCHOR_CACHE_VERSION}.json"
     if not cache_path.exists():
         return False
     try:
         payload = json.loads(cache_path.read_text(encoding="utf-8"))
-        return bool(payload.get("complete") or payload.get("start") or payload.get("end"))
+        return bool(
+            payload.get("layout") == layout
+            and payload.get("inputFingerprint", "") == input_fingerprint
+            and (payload.get("complete") or payload.get("start") or payload.get("end"))
+        )
     except Exception:
         return False
 
@@ -2002,14 +2441,69 @@ def adaptive_ocr_workers(requested: int | None = None) -> int:
         return max(1, min(8, int(override)))
     logical_cpus = os.cpu_count() or 4
     automatic = max(2, min(4, logical_cpus // 3))
+    available_mb = available_memory_mb()
+    if available_mb:
+        memory_limit = max(1, min(4, int(max(0, available_mb - 1200) // 850)))
+        automatic = min(automatic, memory_limit)
     return min(automatic, requested) if requested else automatic
 
 
-def precompute_anchor_cache(job_id: str, page_count: int, layout: str, first_page: int = 1, workers: int | None = None) -> bool:
+def available_memory_mb() -> int:
+    try:
+        if os.name == "nt":
+            class MemoryStatus(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_ulong),
+                    ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+            status = MemoryStatus()
+            status.dwLength = ctypes.sizeof(status)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+                return int(status.ullAvailPhys // (1024 * 1024))
+        if Path("/proc/meminfo").exists():
+            match = re.search(r"^MemAvailable:\s+(\d+)\s+kB", Path("/proc/meminfo").read_text(), re.MULTILINE)
+            if match:
+                return int(match.group(1)) // 1024
+    except (OSError, ValueError, AttributeError):
+        pass
+    return 0
+
+
+def throughput_metrics(started_at: float, completed: int, total: int, **extra) -> dict:
+    elapsed = max(0.001, time.time() - started_at)
+    rate = completed * 60 / elapsed if completed else 0.0
+    eta = round(max(0, total - completed) * 60 / rate) if rate else 0
+    return {
+        **extra,
+        "pagesPerMinute": round(rate, 1),
+        "etaSeconds": eta,
+        "freeMemoryMB": available_memory_mb(),
+    }
+
+
+def precompute_anchor_cache(
+    job_id: str,
+    page_count: int,
+    layout: str,
+    first_page: int = 1,
+    workers: int | None = None,
+    ready_callback: Callable[[int], None] | None = None,
+) -> bool:
+    job = json.loads(job_paths(job_id).meta.read_text(encoding="utf-8"))
+    input_fingerprint = str(job.get("inputFingerprint") or "")
     all_pages = list(range(max(1, first_page), page_count + 1))
-    pages = [page_no for page_no in all_pages if not anchor_cache_ready(job_id, page_no)]
+    pages = [page_no for page_no in all_pages if not anchor_cache_ready(job_id, page_no, layout, input_fingerprint)]
     cached = len(all_pages) - len(pages)
     if not pages:
+        if ready_callback:
+            ready_callback(page_count)
         update_pipeline_stage(
             job_id,
             "ocr",
@@ -2022,7 +2516,22 @@ def precompute_anchor_cache(job_id: str, page_count: int, layout: str, first_pag
         )
         return True
     completed = cached
+    newly_ocr = 0
+    work_started = time.time()
+    ready_pages = {
+        page_no for page_no in all_pages
+        if anchor_cache_ready(job_id, page_no, layout, input_fingerprint)
+    }
+    contiguous_ready = first_page - 1
+    while contiguous_ready + 1 in ready_pages:
+        contiguous_ready += 1
+    if ready_callback and contiguous_ready >= first_page:
+        ready_callback(contiguous_ready)
     worker_count = adaptive_ocr_workers(workers)
+    reusable_starts = sum(
+        (job_paths(job_id).root / f"page-{page_no:04d}-ocr-anchors-v8.json").exists()
+        for page_no in pages
+    ) if ANCHOR_CACHE_VERSION in {9, 10} and str(job.get("layout") or "") == layout else 0
     update_pipeline_stage(
         job_id,
         "ocr",
@@ -2030,14 +2539,42 @@ def precompute_anchor_cache(job_id: str, page_count: int, layout: str, first_pag
         state="planning",
         processed=completed,
         total=page_count,
-        detail=f"{worker_count} 路并行",
-        message=f"正在逐页进行 OCR 双锁边 {completed} / {len(all_pages)}（{worker_count} 路并行）。",
+        detail=f"{worker_count} 路并行，{'PDFium 常驻打开' if pdfium is not None else 'Poppler 分块渲染'}，复用旧页首 {reusable_starts} 页",
+        metrics=throughput_metrics(
+            work_started, newly_ocr, len(pages), workers=worker_count,
+            cachedPages=cached, newlyOcrPages=newly_ocr, renderDpi="120→140 按需复核",
+        ),
+        message=(
+            f"正在复用旧页首、仅更新页尾 OCR {completed} / {len(all_pages)}（{worker_count} 路并行）。"
+            if reusable_starts else
+            f"正在逐页进行 OCR 双锁边 {completed} / {len(all_pages)}（{worker_count} 路并行）。"
+        ),
     )
+    batch_size = 1 if pdfium is not None else 4
+    page_batches = []
+    for page_no in pages:
+        if page_batches and len(page_batches[-1]) < batch_size and page_no == page_batches[-1][-1] + 1:
+            page_batches[-1].append(page_no)
+        else:
+            page_batches.append([page_no])
     with concurrent.futures.ProcessPoolExecutor(max_workers=worker_count) as pool:
-        futures = [pool.submit(precompute_anchor_worker, (job_id, page_no, layout)) for page_no in pages]
-        future_pages = {future: page_no for future, page_no in zip(futures, pages)}
-        pending = set(futures)
+        page_queue = iter(page_batches)
+        future_pages = {}
+        pending = set()
+
+        def fill_worker_queue() -> None:
+            while len(pending) < worker_count * 2:
+                try:
+                    batch = next(page_queue)
+                except StopIteration:
+                    break
+                future = pool.submit(precompute_anchor_worker, (job_id, tuple(batch), layout))
+                future_pages[future] = tuple(batch)
+                pending.add(future)
+
+        fill_worker_queue()
         last_progress = time.time()
+        last_heartbeat = last_progress
         paused = False
         while pending:
             done, pending = concurrent.futures.wait(
@@ -2048,7 +2585,7 @@ def precompute_anchor_cache(job_id: str, page_count: int, layout: str, first_pag
             if not done:
                 idle_seconds = time.time() - last_progress
                 if idle_seconds > OCR_IDLE_TIMEOUT_SECONDS:
-                    waiting_pages = sorted(future_pages[future] for future in pending)
+                    waiting_pages = sorted(page for future in pending for page in future_pages[future])
                     for future in pending:
                         future.cancel()
                     update_pipeline_stage(
@@ -2064,13 +2601,76 @@ def precompute_anchor_cache(job_id: str, page_count: int, layout: str, first_pag
                         stalledPages=waiting_pages[:20],
                     )
                     raise TimeoutError("OCR worker stalled")
+                if time.time() - last_heartbeat >= 30:
+                    waiting_pages = sorted(page for future in pending for page in future_pages[future])
+                    update_pipeline_stage(
+                        job_id,
+                        "ocr",
+                        "running",
+                        state="planning",
+                        processed=completed,
+                        total=page_count,
+                        detail=f"工作进程仍在计算第 {', '.join(map(str, waiting_pages[:4]))} 页",
+                        metrics=throughput_metrics(
+                            work_started, newly_ocr, len(pages), workers=worker_count,
+                            cachedPages=cached, newlyOcrPages=newly_ocr,
+                            idleSeconds=round(idle_seconds, 1), renderDpi="120→140 按需复核",
+                        ),
+                        message="OCR 工作进程仍在计算，连续页进度将在页面完成后推进。",
+                    )
+                    last_heartbeat = time.time()
                 continue
             last_progress = time.time()
+            last_heartbeat = last_progress
+            previous_contiguous = contiguous_ready
             for future in done:
-                future.result()
-                completed += 1
-                page_no = future_pages.get(future)
-                if page_no:
+                batch_pages = future_pages.pop(future, ())
+                try:
+                    results = future.result()
+                except Exception as error:
+                    for pending_future in pending:
+                        pending_future.cancel()
+                    failed_page = batch_pages[0] if batch_pages else None
+                    page_detail = f"第 {failed_page} 页" if failed_page else "当前批次"
+                    update_pipeline_stage(
+                        job_id,
+                        "ocr",
+                        "error",
+                        state="error",
+                        processed=completed,
+                        total=page_count,
+                        currentPage=failed_page,
+                        detail=f"{page_detail}工作进程异常退出；已有缓存保留",
+                        message=f"OCR 工作进程异常退出，任务已停止且没有误报进度：{error}",
+                    )
+                    raise RuntimeError(f"{page_detail} OCR 工作进程异常退出：{error}") from error
+                worker_failure = next(((page_no, error) for page_no, _, error in results if error), None)
+                for result_page, _, worker_error in results:
+                    if worker_error:
+                        continue
+                    completed += 1
+                    newly_ocr += 1
+                    ready_pages.add(result_page)
+                    while contiguous_ready + 1 in ready_pages:
+                        contiguous_ready += 1
+                if worker_failure:
+                    result_page, worker_error = worker_failure
+                    for pending_future in pending:
+                        pending_future.cancel()
+                    update_pipeline_stage(
+                        job_id,
+                        "ocr",
+                        "error",
+                        state="error",
+                        processed=completed,
+                        total=page_count,
+                        currentPage=result_page,
+                        detail=f"第 {result_page} 页 OCR 失败；已有缓存保留",
+                        message=f"第 {result_page} 页 OCR 失败，任务已停止，未把失败页误计为完成：{worker_error}",
+                    )
+                    raise RuntimeError(f"第 {result_page} 页 OCR 失败：{worker_error}")
+                page_no = results[-1][0] if results else None
+                if page_no and (completed == 1 or completed % 5 == 0 or completed == len(all_pages)):
                     update_pipeline_stage(
                         job_id,
                         "ocr",
@@ -2080,6 +2680,11 @@ def precompute_anchor_cache(job_id: str, page_count: int, layout: str, first_pag
                         total=page_count,
                         currentPage=page_no,
                         detail=f"{worker_count} 路并行，当前完成第 {page_no} 页",
+                        metrics=throughput_metrics(
+                            work_started, newly_ocr, len(pages), workers=worker_count,
+                            cachedPages=cached, newlyOcrPages=newly_ocr,
+                            idleSeconds=0, renderDpi="120→140 按需复核",
+                        ),
                         message=f"正在逐页进行 OCR 双锁边 {completed} / {len(all_pages)}（{worker_count} 路并行）。",
                     )
                 if read_full_status(job_id).get("pauseRequested"):
@@ -2088,6 +2693,10 @@ def precompute_anchor_cache(job_id: str, page_count: int, layout: str, first_pag
                         pending_future.cancel()
                     pending.clear()
                     break
+            if not paused:
+                fill_worker_queue()
+                if ready_callback and contiguous_ready > previous_contiguous:
+                    ready_callback(contiguous_ready)
     if paused:
         update_pipeline_stage(
             job_id,
@@ -2101,15 +2710,27 @@ def precompute_anchor_cache(job_id: str, page_count: int, layout: str, first_pag
             pauseRequested=False,
         )
         return False
+    update_pipeline_stage(
+        job_id,
+        "ocr",
+        "done",
+        state="planning",
+        processed=len(all_pages),
+        total=page_count,
+        detail=f"双锁边 OCR 已完成；缓存 {len(all_pages)} 页",
+        metrics=throughput_metrics(
+            work_started, newly_ocr, len(pages), workers=worker_count,
+            cachedPages=cached, newlyOcrPages=newly_ocr, renderDpi="120→140 按需复核",
+        ),
+        message="双锁边 OCR 已完成，对齐器正在收口检查连续页与章节边界。",
+    )
     return True
 
 
 def ocr_page_text(job: dict, page_no: int, layout: str, anchors_only: bool = True) -> str:
     if anchors_only:
         return "\n".join(value for value in ocr_page_anchor_pair(job, page_no, layout) if value.strip())
-    job_id = str(job.get("id") or "").strip()
-    paths = job_paths(job_id) if job_id else None
-    cache_path = (paths.root / f"page-{page_no:04d}-ocr-full-v2.txt") if paths else Path(job["pdf"]).parent / f"page-{page_no:04d}-ocr-full-v2.txt"
+    cache_path = full_ocr_cache_path(job, page_no, layout)
     if cache_path.exists():
         text = cache_path.read_text(encoding="utf-8", errors="ignore")
         if text.strip() or get_ocr_engine() is None:
@@ -2118,15 +2739,36 @@ def ocr_page_text(job: dict, page_no: int, layout: str, anchors_only: bool = Tru
                 atomic_write_text(cache_path, cleaned)
             return cleaned
     image = render_page_image(Path(job["pdf"]), page_no, dpi=160)
-    text = ocr_image_text(image, cache_path.with_suffix(".full.png"), layout)
+    text = ocr_image_text(image, layout)
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     atomic_write_text(cache_path, text)
     return text
 
 
+def full_ocr_cache_path(job: dict, page_no: int, layout: str) -> Path:
+    job_id = str(job.get("id") or "").strip()
+    cache_name = f"page-{page_no:04d}-ocr-full-v3-{layout}.txt"
+    return job_paths(job_id).root / cache_name if job_id else Path(job["pdf"]).parent / cache_name
+
+
+def full_page_ocr_worker(payload: tuple[str, int, str]) -> tuple[int, str, str]:
+    job_id, page_no, layout = payload
+    try:
+        job = json.loads(job_paths(job_id).meta.read_text(encoding="utf-8"))
+        cache_path = full_ocr_cache_path(job, page_no, layout)
+        if cache_path.exists():
+            return page_no, ocr_page_text(job, page_no, layout, anchors_only=False), ""
+        image = render_page_images_persistent(Path(job["pdf"]), [page_no], dpi=160)[0]
+        text = ocr_image_text(image, layout)
+        atomic_write_text(cache_path, text)
+        return page_no, text, ""
+    except Exception as error:
+        return page_no, "", str(error)
+
+
 def page_anchor_text(job: dict, reader: PdfReader, page_no: int, layout: str) -> str:
     job_id = str(job.get("id") or "").strip()
-    if job_id and anchor_cache_ready(job_id, page_no):
+    if job_id and anchor_cache_ready(job_id, page_no, layout, str(job.get("inputFingerprint") or "")):
         return ocr_page_text(job, page_no, layout, anchors_only=True)
     extracted = reader.pages[page_no - 1].extract_text() or ""
     normalized, _ = normalize_for_match(extracted)
@@ -2137,7 +2779,7 @@ def page_anchor_text(job: dict, reader: PdfReader, page_no: int, layout: str) ->
 
 def page_anchor_pair(job: dict, reader: PdfReader, page_no: int, layout: str) -> tuple[str, str]:
     job_id = str(job.get("id") or "").strip()
-    if job_id and anchor_cache_ready(job_id, page_no):
+    if job_id and anchor_cache_ready(job_id, page_no, layout, str(job.get("inputFingerprint") or "")):
         return ocr_page_anchor_pair(job, page_no, layout)
     extracted = reader.pages[page_no - 1].extract_text() or ""
     normalized, _ = normalize_for_match(extracted)
@@ -2200,14 +2842,34 @@ def match_page_source(
     start_text: str,
     end_text: str,
     allow_discovery: bool = True,
-    candidate_units: list[SourceUnit] | None = None,
+    candidate_units: list[SourceUnit | SourceWindow] | None = None,
 ) -> dict | None:
     best = None
-    for unit in candidate_units if candidate_units is not None else load_source_units(job):
+    source_candidates = candidate_units
+    if source_candidates is None:
+        source_candidates = source_alignment_windows(load_source_units(job))
+    for unit in source_candidates:
         match = strict_pair_in_text(unit.text, start_text, end_text)
         if not match:
             continue
+        if isinstance(unit, SourceWindow) and unit.boundary is not None:
+            if not (int(match["start"]) < unit.boundary < int(match["end"])):
+                continue
         candidate = {**match, "sourceTitle": unit.title, "sourceUrl": unit.url, "sourceKind": unit.kind}
+        if isinstance(unit, SourceWindow):
+            candidate.update({
+                "sourceStartOrder": unit.start_order,
+                "sourceEndOrder": unit.end_order,
+                "sourceStartUrl": unit.start_url,
+                "sourceEndUrl": unit.end_url,
+                "sourceStartTitle": unit.start_title,
+                "sourceEndTitle": unit.end_title,
+                "globalStart": unit.global_norm_start + int(match["start"]),
+                "globalEnd": unit.global_norm_start + int(match["end"]),
+                "globalRawStart": unit.global_raw_start + int(match["rawStart"]),
+                "globalRawEnd": unit.global_raw_start + int(match["rawEnd"]),
+                "crossesSourceUnit": unit.boundary is not None,
+            })
         candidate["authorityRank"] = source_preference_rank(job, unit)
         if best is None or (candidate["authorityRank"], candidate["confidence"]) > (best.get("authorityRank", 0), best["confidence"]):
             best = candidate
@@ -2236,11 +2898,13 @@ def match_page_source(
 def match_full_ocr_bounds(job: dict, full_text: str) -> dict | None:
     """Use whole-page OCR only as a boundary fallback; returned text still comes from the source."""
     best = None
-    for unit in load_source_units(job):
+    for unit in source_alignment_windows(load_source_units(job)):
         match = strict_pair_in_text(unit.text, full_text, full_text)
         if not match:
             continue
-        if "/" in unit.title and int(match.get("start") or 0) < 500:
+        if unit.boundary is not None and not (int(match["start"]) < unit.boundary < int(match["end"])):
+            continue
+        if unit.boundary is None and "/" in unit.title and int(match.get("start") or 0) < 500:
             base_norm, _ = normalize_for_match(unit.title.split("/", 1)[0])
             tail_norm, _ = normalize_for_match(unit.title.rsplit("/", 1)[-1])
             page_norm, _ = normalize_for_match(full_text.replace("第", ""))
@@ -2254,6 +2918,17 @@ def match_full_ocr_bounds(job: dict, full_text: str) -> dict | None:
             "sourceUrl": unit.url,
             "sourceKind": unit.kind,
             "authorityRank": source_preference_rank(job, unit),
+            "sourceStartOrder": unit.start_order,
+            "sourceEndOrder": unit.end_order,
+            "sourceStartUrl": unit.start_url,
+            "sourceEndUrl": unit.end_url,
+            "sourceStartTitle": unit.start_title,
+            "sourceEndTitle": unit.end_title,
+            "globalStart": unit.global_norm_start + int(match["start"]),
+            "globalEnd": unit.global_norm_start + int(match["end"]),
+            "globalRawStart": unit.global_raw_start + int(match["rawStart"]),
+            "globalRawEnd": unit.global_raw_start + int(match["rawEnd"]),
+            "crossesSourceUnit": unit.boundary is not None,
         }
         if best is None or (candidate["authorityRank"], candidate["confidence"]) > (best["authorityRank"], best["confidence"]):
             best = candidate
@@ -2270,49 +2945,104 @@ def apply_previous_page_continuity(job: dict, previous: dict | None, current: di
     previous_end = int(previous.get("end") or 0)
     current_start = int(current.get("start") or 0)
     gap = current_start - previous_end
-    unit = next((unit for unit in load_source_units(job) if (unit.url or unit.title) == current_key), None)
-    if not unit:
+    if gap == 0:
         return current
-    source_norm, mapping = normalize_source_cached(unit.text)
-    current_end = int(current.get("end") or 0)
-    if not source_norm or not mapping or current_end <= previous_end:
-        return {
-            **current,
-            "kind": "unresolved",
-            "status": "顺序冲突",
-            "text": "",
-            "confidence": 0,
-            "reason": "本页与上一页正文重叠或倒退，已拒绝写入。",
-        }
-    if gap < -80 or gap > 500:
-        return {
-            **current,
-            "kind": "unresolved",
-            "status": "连续性未通过",
-            "text": "",
-            "confidence": 0,
-            "reason": "本页与上一页权威正文之间存在过大跳跃，已拒绝写入。",
-        }
-    if gap <= 0:
-        current.update({
-            "start": previous_end,
-            "text": original_slice(unit.text, mapping, previous_end, max(previous_end, current_end - 1)),
-            "status": "双锁连续去重",
-            "continuityOverlap": abs(gap),
-            "reason": "页边锚点略有重叠，已按上一页可靠页尾去除重复文字。",
-        })
-        return current
-    gap_text = original_slice(unit.text, mapping, previous_end, max(previous_end, current_start - 1))
-    if re.search(r"(?:卷[之]?[上中下]|卷[一二三四五六七八九十]+|全書[始終]|全书[始终])", gap_text):
-        return current
-    current.update({
-        "start": previous_end,
-        "text": original_slice(unit.text, mapping, previous_end, max(previous_end, current_end - 1)),
-        "status": "双锁连续补首",
-        "continuityFilled": gap,
-        "reason": "本页首列 OCR 漏读，已用上一页可靠页尾补齐本页开头。",
-    })
-    return current
+    return {
+        **current,
+        "kind": "unresolved",
+        "status": "页界未唯一锁定",
+        "text": "",
+        "confidence": 0,
+        "boundaryGap": gap,
+        "reason": "本页识别边界与上一页不连续；系统保留 OCR 页首、页尾，不再自动补字或删字。",
+    }
+
+
+def enforce_adjacent_page_boundaries(manifest: list[dict]) -> int:
+    conflicts = 0
+    for index, item in enumerate(manifest[:-1]):
+        following = manifest[index + 1]
+        if item.get("kind") != "body" or following.get("kind") != "body":
+            continue
+        use_global_boundary = "globalRawEnd" in item and "globalRawStart" in following
+        source_key = item_source_key(item)
+        if not use_global_boundary and (not source_key or source_key != item_source_key(following)):
+            continue
+        use_raw_boundary = "rawEnd" in item and "rawStart" in following
+        if use_global_boundary:
+            end = int(item["globalRawEnd"])
+            following_start = int(following["globalRawStart"])
+            if end != following_start and source_key != item_source_key(following):
+                end = int(item.get("globalEnd", end))
+                following_start = int(following.get("globalStart", following_start))
+        else:
+            end = int(item.get("rawEnd") if use_raw_boundary else item.get("end") or 0)
+            following_start = int(following.get("rawStart") if use_raw_boundary else following.get("start") or 0)
+        if end == following_start:
+            item["nextPageGap"] = 0
+            following["previousPageGap"] = 0
+            continue
+        gap = following_start - end
+        conflicts += 1
+        item["nextPageGap"] = gap
+        following["previousPageGap"] = gap
+        message = "相邻两页的权威正文边界不完全相接；系统保留单页锁定结果并阻止整本发布。"
+        item["continuityWarning"] = message
+        following["continuityWarning"] = message
+    return conflicts
+
+
+def enforce_recognized_page_edges(
+    job: dict,
+    reader: PdfReader,
+    manifest: list[dict],
+    layout: str,
+    units_by_key: dict[str, SourceUnit | SourceWindow],
+) -> int:
+    rejected = 0
+    for index, item in enumerate(manifest):
+        if item.get("kind") != "body":
+            continue
+        unit = units_by_key.get(item_source_key(item))
+        if unit is None:
+            continue
+        source_norm, mapping = normalize_source_cached(unit.text)
+        start = int(item.get("start") or 0)
+        end = int(item.get("end") or 0)
+        if not source_norm or not mapping or end <= start:
+            page_slice = None
+            start_anchor = str(item.get("startAnchor") or "")
+            end_anchor = str(item.get("endAnchor") or "")
+        else:
+            start_anchor = str(item.get("startAnchor") or "")
+            end_anchor = str(item.get("endAnchor") or "")
+            if not start_anchor or not end_anchor:
+                start_anchor, end_anchor = page_anchor_pair(job, reader, index + 1, layout)
+            page_slice = strict_page_slice_from_edges(
+                unit.text, mapping, start, end, start_anchor, end_anchor
+            )
+        if page_slice is None:
+            item.update({
+                "kind": "unresolved",
+                "status": "页边文字未精确对应",
+                "text": "",
+                "confidence": 0,
+                "startAnchor": start_anchor,
+                "endAnchor": end_anchor,
+                "reason": "写入范围未能从识别出的首字符（含标点）开始并在识别出的末字符结束。",
+            })
+            rejected += 1
+            continue
+        item.update(page_slice)
+        if isinstance(unit, SourceWindow):
+            item["globalStart"] = unit.global_norm_start + int(page_slice["start"])
+            item["globalEnd"] = unit.global_norm_start + int(page_slice["end"])
+            item["globalRawStart"] = unit.global_raw_start + int(page_slice["rawStart"])
+            item["globalRawEnd"] = unit.global_raw_start + int(page_slice["rawEnd"])
+        item["startAnchor"] = start_anchor
+        item["endAnchor"] = end_anchor
+        item["edgeVerified"] = True
+    return rejected
 
 
 def resolve_page(
@@ -2321,41 +3051,37 @@ def resolve_page(
     page_no: int,
     layout: str,
     allow_discovery: bool = True,
-    candidate_units: list[SourceUnit] | None = None,
+    candidate_units: list[SourceUnit | SourceWindow] | None = None,
 ) -> dict:
     early_full_text = None
+    early_decision = None
     if FULL_OCR_FALLBACK_ENABLED and page_no <= 12:
         early_full_text = ocr_page_text(job, page_no, layout, anchors_only=False)
         early_decision = classify_page(job, reader, page_no, layout, early_full_text)
-        if early_decision["kind"] in {"ocr", "blank"}:
-            early_text = prepared_ocr_page_text(early_full_text, early_decision["reason"])
+        if early_decision["kind"] == "blank":
             return {
-                "kind": early_decision["kind"],
-                "status": "整页 OCR" if early_decision["kind"] == "ocr" else "空白页",
+                "kind": "blank",
+                "status": "空白页",
                 "page": page_no,
-                "text": early_text if early_decision["kind"] == "ocr" else "",
-                "confidence": 70 if early_decision["kind"] == "ocr" else 100,
-                "sourceTitle": "本页 OCR" if early_decision["kind"] == "ocr" else "",
+                "text": "",
+                "confidence": 100,
+                "sourceTitle": "",
                 "reason": early_decision["reason"],
             }
     start_text, end_text = page_anchor_pair(job, reader, page_no, layout)
     anchor_lines = [normalize_for_match(line)[0] for line in re.split(r"[\r\n]+", f"{start_text}\n{end_text}") if normalize_for_match(line)[0]]
     anchor_short_ratio = sum(1 for line in anchor_lines if len(line) <= 9) / max(1, len(anchor_lines))
-    if FULL_OCR_FALLBACK_ENABLED and page_no <= 20 and len(anchor_lines) >= 5 and anchor_short_ratio >= 0.78:
-        full_text = early_full_text if early_full_text is not None else ocr_page_text(job, page_no, layout, anchors_only=False)
-        return {
-            "kind": "ocr",
-            "status": "整页 OCR",
-            "page": page_no,
-            "text": full_text,
-            "confidence": 75,
-            "sourceTitle": "本页 OCR",
-            "reason": "检测到目录式短条目页面",
-        }
+    looks_like_directory = page_no <= 20 and len(anchor_lines) >= 5 and anchor_short_ratio >= 0.78
     match = match_page_source(job, start_text, end_text, allow_discovery=False, candidate_units=candidate_units)
     weak_match = match if match and int(match.get("authorityRank") or 0) < 40 else None
     if match and not weak_match:
-        match.update({"kind": "body", "status": "双头锁边", "page": page_no, "startAnchor": start_text, "endAnchor": end_text})
+        match.update({
+            "kind": "body",
+            "status": "跨章节双头锁边" if match.get("crossesSourceUnit") else "双头锁边",
+            "page": page_no,
+            "startAnchor": start_text,
+            "endAnchor": end_text,
+        })
         return match
     full_text = ""
     if FULL_OCR_FALLBACK_ENABLED:
@@ -2382,17 +3108,20 @@ def resolve_page(
         })
         return weak_match
     title_switch = False
+    special_unresolved = None
     if FULL_OCR_FALLBACK_ENABLED:
-        decision = classify_page(job, reader, page_no, layout, full_text)
+        decision = early_decision or classify_page(job, reader, page_no, layout, full_text)
         if decision["kind"] == "ocr":
-            return {
-                "kind": "ocr",
-                "status": "整页 OCR",
+            special_unresolved = {
+                "kind": "unresolved",
+                "status": "来源内容未锁定",
                 "page": page_no,
-                "text": prepared_ocr_page_text(full_text, decision["reason"]),
-                "confidence": 70,
-                "sourceTitle": "本页 OCR",
-                "reason": decision["reason"],
+                "text": "",
+                "confidence": 0,
+                "sourceTitle": "",
+                "startAnchor": start_text,
+                "endAnchor": end_text,
+                "reason": "该页疑似目录、卷题或其他特殊内容，但未在权威来源中严格锁定；若来源未收录，最终仅保留扫描底图。" if looks_like_directory else "该特殊页面未在权威来源中严格锁定，不使用 OCR 文字替代权威文字。",
             }
         if decision["kind"] == "blank":
             return {
@@ -2417,6 +3146,8 @@ def resolve_page(
                 "endAnchor": end_text,
             })
             return discovered_match
+    if special_unresolved:
+        return special_unresolved
     return {
         "kind": "unresolved",
         "status": "未锁定",
@@ -2614,31 +3345,57 @@ def build_page_manifest(job: dict, reader: PdfReader) -> list[dict] | None:
     return manifest
 
 
-def build_strict_page_manifest(job: dict, reader: PdfReader, layout: str, status_job_id: str = "") -> list[dict]:
+PIPELINE_COMMIT_STATUSES = {"双头锁边", "跨章节双头锁边", "全文 OCR 边界校准"}
+
+
+def strict_pair_committable(previous: dict, current: dict) -> bool:
+    if previous.get("kind") != "body" or current.get("kind") != "body":
+        return False
+    if previous.get("status") not in PIPELINE_COMMIT_STATUSES or current.get("status") not in PIPELINE_COMMIT_STATUSES:
+        return False
+    if "globalRawEnd" in previous and "globalRawStart" in current:
+        if int(previous["globalRawEnd"]) == int(current["globalRawStart"]):
+            return True
+        if item_source_key(previous) != item_source_key(current):
+            return (
+                "globalEnd" in previous
+                and "globalStart" in current
+                and int(previous["globalEnd"]) == int(current["globalStart"])
+            )
+        return False
+    previous_key = item_source_key(previous)
+    if not previous_key or previous_key != item_source_key(current):
+        return False
+    return "rawEnd" in previous and "rawStart" in current and int(previous["rawEnd"]) == int(current["rawStart"])
+
+
+def build_strict_page_manifest(
+    job: dict,
+    reader: PdfReader,
+    layout: str,
+    status_job_id: str = "",
+    commit_callback: Callable[[int, dict], None] | None = None,
+) -> list[dict]:
     page_count = len(reader.pages)
-    if status_job_id:
-        if not precompute_anchor_cache(status_job_id, page_count, layout, first_page=1):
-            raise TaskPaused()
-        update_pipeline_stage(
-            status_job_id,
-            "align",
-            "running",
-            state="planning",
-            processed=0,
-            total=page_count,
-            detail="正在按 EPUB 章节顺序逐页双锁",
-            message="页边 OCR 已就绪，正在锁定权威正文范围。",
-        )
     manifest = []
     source_cursors: dict[str, int] = {}
     units = load_source_units(job)
+    alignment_windows = source_alignment_windows(units)
     unit_indexes = {(unit.url or unit.title): index for index, unit in enumerate(units)}
+    unit_indexes.update({window.url: window.end_order for window in alignment_windows})
     active_unit = 0
-    for page_no in range(1, page_count + 1):
+    global_cursor = 0
+    alignment_started = time.time()
+
+    def process_page(page_no: int) -> None:
+        nonlocal active_unit, global_cursor
         if units:
             left = max(0, active_unit - 1)
             right = min(len(units), active_unit + 4)
-            candidates = units[left:right]
+            candidates = [
+                window for window in alignment_windows
+                if window.start_order >= left and window.end_order < right
+            ]
         else:
             candidates = None
         resolved = resolve_page(
@@ -2649,25 +3406,53 @@ def build_strict_page_manifest(job: dict, reader: PdfReader, layout: str, status
             allow_discovery=not bool(units),
             candidate_units=candidates,
         )
-        resolved = apply_previous_page_continuity(job, manifest[-1] if manifest else None, resolved)
         source_key = str(resolved.get("sourceUrl") or resolved.get("sourceTitle") or "")
         if resolved.get("kind") == "body" and source_key:
-            active_unit = max(active_unit, unit_indexes.get(source_key, active_unit))
-            previous = source_cursors.get(source_key)
-            start = int(resolved.get("start") or 0)
-            end = int(resolved.get("end") or 0)
-            if previous is not None and start < previous - 120:
+            resolved_start_unit = int(resolved.get("sourceStartOrder", unit_indexes.get(source_key, active_unit)))
+            resolved_end_unit = int(resolved.get("sourceEndOrder", unit_indexes.get(source_key, active_unit)))
+            if resolved_start_unit < active_unit:
                 resolved = {
                     **resolved,
                     "kind": "unresolved",
-                    "status": "顺序冲突",
+                    "status": "章节顺序冲突",
                     "text": "",
                     "confidence": 0,
-                    "reason": "该页会使同一正文来源倒退，已拒绝写入。",
+                    "reason": "该页会使 EPUB 章节顺序倒退，已拒绝写入。",
                 }
             else:
-                source_cursors[source_key] = max(previous or 0, end)
+                active_unit = max(active_unit, resolved_end_unit)
+                global_start = resolved.get("globalStart")
+                global_end = resolved.get("globalEnd")
+                if global_start is not None and int(global_start) < global_cursor - 120:
+                    resolved = {
+                        **resolved,
+                        "kind": "unresolved",
+                        "status": "顺序冲突",
+                        "text": "",
+                        "confidence": 0,
+                        "reason": "该页会使全书权威正文坐标倒退，已拒绝写入。",
+                    }
+                elif global_end is not None:
+                    global_cursor = max(global_cursor, int(global_end))
+                previous = source_cursors.get(source_key)
+                start = int(resolved.get("start") or 0)
+                end = int(resolved.get("end") or 0)
+                if previous is not None and start < previous - 120:
+                    resolved = {
+                        **resolved,
+                        "kind": "unresolved",
+                        "status": "顺序冲突",
+                        "text": "",
+                        "confidence": 0,
+                        "reason": "该页会使同一正文来源倒退，已拒绝写入。",
+                    }
+                else:
+                    source_cursors[source_key] = max(previous or 0, end)
         manifest.append(resolved)
+        if len(manifest) >= 2 and commit_callback:
+            previous_item = manifest[-2]
+            if strict_pair_committable(previous_item, resolved):
+                commit_callback(page_no - 1, dict(previous_item))
         if status_job_id and (page_no == 1 or page_no % 25 == 0 or page_no == page_count):
             update_pipeline_stage(
                 status_job_id,
@@ -2678,14 +3463,41 @@ def build_strict_page_manifest(job: dict, reader: PdfReader, layout: str, status
                 total=page_count,
                 currentPage=page_no,
                 detail=f"当前第 {page_no} 页",
-                message=f"正在核对第 {page_no} / {page_count} 页。",
+                metrics=throughput_metrics(
+                    alignment_started, page_no, page_count,
+                    operation="权威正文检索与严格页界校验",
+                ),
+                message=f"OCR、严格对齐与已确认页面写入正在流水运行：已对齐 {page_no} / {page_count} 页。",
             )
-            if read_full_status(status_job_id).get("pauseRequested"):
-                raise TaskPaused()
 
-    units_by_key = {}
-    for unit in units:
-        units_by_key[unit.url or unit.title] = unit
+    def process_contiguous_ready(contiguous_page: int) -> None:
+        target = max(0, min(page_count, contiguous_page - 1))
+        while len(manifest) < target:
+            process_page(len(manifest) + 1)
+
+    if status_job_id:
+        update_pipeline_stage(
+            status_job_id,
+            "align",
+            "running",
+            state="planning",
+            processed=0,
+            total=page_count,
+            detail="等待连续 OCR 页，保留一页反向确认窗口",
+            message="OCR 与权威正文对齐已进入流水处理。",
+        )
+        if not precompute_anchor_cache(
+            status_job_id,
+            page_count,
+            layout,
+            first_page=1,
+            ready_callback=process_contiguous_ready,
+        ):
+            raise TaskPaused()
+    while len(manifest) < page_count:
+        process_page(len(manifest) + 1)
+
+    units_by_key = {window.url: window for window in alignment_windows}
 
     if FULL_OCR_FALLBACK_ENABLED:
         for index, item in enumerate(manifest):
@@ -2704,54 +3516,33 @@ def build_strict_page_manifest(job: dict, reader: PdfReader, layout: str, status
                 "reason": "页首页尾 OCR 不足，仅用整页 OCR 确认边界；写入文字仍来自权威正文。",
             })
 
-    for index, item in enumerate(manifest):
-        if item.get("kind") != "unresolved" or index == 0 or index >= len(manifest) - 1:
-            continue
-        previous = manifest[index - 1]
-        following = manifest[index + 1]
-        previous_key = str(previous.get("sourceUrl") or previous.get("sourceTitle") or "")
-        following_key = str(following.get("sourceUrl") or following.get("sourceTitle") or "")
-        if previous.get("kind") != "body" or following.get("kind") != "body" or not previous_key or previous_key != following_key:
-            continue
-        start = int(previous.get("end") or 0)
-        end = int(following.get("start") or 0)
-        if end <= start or end - start > 5000:
-            continue
-        unit = units_by_key.get(previous_key)
-        if not unit:
-            continue
-        source_norm, mapping = normalize_source_cached(unit.text)
-        if not source_norm or not mapping:
-            continue
-        item.update({
-            "kind": "body",
-            "status": "相邻双锁约束",
-            "sourceTitle": unit.title,
-            "sourceUrl": unit.url,
-            "sourceKind": unit.kind,
-            "start": start,
-            "end": end,
-            "text": original_slice(unit.text, mapping, start, max(start, end - 1)),
-            "confidence": max(75, min(int(previous.get("confidence") or 0), int(following.get("confidence") or 0)) - 5),
-            "reason": "本页 OCR 边缘不足，由前后两页同一来源的可靠双锁边界唯一约束。",
-            "adjacentVerified": True,
-        })
+    boundary_conflicts = enforce_adjacent_page_boundaries(manifest)
+    recovered = recover_unresolved_runs(job, reader, manifest, layout, units_by_key)
+    chapter_recovered = recover_chapter_transition_runs(job, reader, manifest, layout, units, unit_indexes)
+    boundary_conflicts += enforce_adjacent_page_boundaries(manifest)
+    edge_rejected = enforce_recognized_page_edges(job, reader, manifest, layout, units_by_key)
+    boundary_conflicts += enforce_adjacent_page_boundaries(manifest)
 
     for index, item in enumerate(manifest[:-1]):
         next_item = manifest[index + 1]
         if item.get("kind") != "body" or next_item.get("kind") != "body":
             continue
-        source_key = str(item.get("sourceUrl") or item.get("sourceTitle") or "")
-        next_key = str(next_item.get("sourceUrl") or next_item.get("sourceTitle") or "")
-        if not source_key or source_key != next_key:
-            continue
-        end = int(item.get("end") or 0)
-        next_start = int(next_item.get("start") or 0)
+        if "globalEnd" in item and "globalStart" in next_item:
+            end = int(item["globalEnd"])
+            next_start = int(next_item["globalStart"])
+        else:
+            source_key = str(item.get("sourceUrl") or item.get("sourceTitle") or "")
+            next_key = str(next_item.get("sourceUrl") or next_item.get("sourceTitle") or "")
+            if not source_key or source_key != next_key:
+                continue
+            end = int(item.get("end") or 0)
+            next_start = int(next_item.get("start") or 0)
         gap = next_start - end
         item["nextPageGap"] = gap
         if abs(gap) > 80:
             item["continuityWarning"] = "本页页尾与下一页页首存在未解释间隔，禁止用下一页边界覆盖本页。"
     mark_source_omitted_pages(job, reader, manifest, layout, units)
+    source_omitted_ocr = fill_source_omitted_ocr(job, manifest, layout, status_job_id)
     if status_job_id:
         unresolved = sum(1 for item in manifest if item.get("kind") == "unresolved")
         locked = sum(1 for item in manifest if item.get("kind") == "body")
@@ -2763,8 +3554,8 @@ def build_strict_page_manifest(job: dict, reader: PdfReader, layout: str, status
             state="planning",
             processed=page_count,
             total=page_count,
-            detail=f"正文锁定 {locked} 页，待核对 {unresolved} 页",
-            metrics={"locked": locked, "unresolved": unresolved},
+            detail=f"正文锁定 {locked} 页，恢复 {recovered + chapter_recovered} 页，待核对 {unresolved} 页",
+            metrics={"locked": locked, "recovered": recovered + chapter_recovered, "chapterRecovered": chapter_recovered, "boundaryConflicts": boundary_conflicts, "edgeRejected": edge_rejected, "unresolved": unresolved},
         )
         update_pipeline_stage(
             status_job_id,
@@ -2774,9 +3565,268 @@ def build_strict_page_manifest(job: dict, reader: PdfReader, layout: str, status
             processed=omitted,
             total=omitted,
             detail=f"来源未收录 {omitted} 页，保留扫描画面",
-            metrics={"sourceOmitted": omitted},
+            metrics={"sourceOmitted": omitted, "sourceOmittedOcr": source_omitted_ocr},
         )
     return manifest
+
+
+def unresolved_runs(manifest: list[dict]) -> list[tuple[int, int]]:
+    runs = []
+    run_start = None
+    for index, item in enumerate([*manifest, {"kind": "sentinel"}]):
+        if item.get("kind") == "unresolved" and run_start is None:
+            run_start = index
+        elif item.get("kind") != "unresolved" and run_start is not None:
+            runs.append((run_start, index - 1))
+            run_start = None
+    return runs
+
+
+def recover_unresolved_runs(
+    job: dict,
+    reader: PdfReader,
+    manifest: list[dict],
+    layout: str,
+    units_by_key: dict[str, SourceUnit],
+) -> int:
+    """Recover only unresolved runs whose page boundaries are fully anchored."""
+    recovered = 0
+    for start_index, end_index in unresolved_runs(manifest):
+        if any(manifest[index].get("status") in STRICT_BOUNDARY_BLOCK_STATUSES for index in range(start_index, end_index + 1)):
+            continue
+        if start_index == 0 or end_index + 1 >= len(manifest):
+            continue
+        previous = manifest[start_index - 1]
+        following = manifest[end_index + 1]
+        previous_key = str(previous.get("sourceUrl") or previous.get("sourceTitle") or "")
+        following_key = str(following.get("sourceUrl") or following.get("sourceTitle") or "")
+        if previous.get("kind") != "body" or following.get("kind") != "body" or not previous_key or previous_key != following_key:
+            continue
+        unit = units_by_key.get(previous_key)
+        if not unit:
+            continue
+        source_norm, mapping = normalize_source_cached(unit.text)
+        start = int(previous.get("end") or 0)
+        end = int(following.get("start") or 0)
+        page_total = end_index - start_index + 1
+        if not source_norm or not mapping or end <= start or end - start > max(5000, 1800 * page_total):
+            continue
+
+        boundaries: dict[int, int] = {0: start, page_total: end}
+        usable = True
+        for offset, page_no in enumerate(range(start_index + 1, end_index + 2)):
+            hits = bounded_page_anchor_hits(job, reader, page_no, layout, unit, start, end)
+            start_hits = [hit for hit in hits if hit[0] == "start"]
+            end_hits = [hit for hit in hits if hit[0] == "end"]
+            if start_hits and offset > 0:
+                boundaries[offset] = min(hit[1] for hit in start_hits)
+            if end_hits and offset + 1 < page_total:
+                boundaries[offset + 1] = max(hit[2] for hit in end_hits)
+            if not start_hits and not end_hits:
+                usable = False
+                break
+        if not usable or any(index not in boundaries for index in range(page_total + 1)):
+            continue
+        ordered = [boundaries[index] for index in range(page_total + 1)]
+        if any(right <= left for left, right in zip(ordered, ordered[1:])):
+            continue
+
+        page_slices = []
+        for offset, page_no in enumerate(range(start_index + 1, end_index + 2)):
+            start_anchor, end_anchor = page_anchor_pair(job, reader, page_no, layout)
+            page_text = strict_page_text_from_edges(
+                unit.text, mapping, ordered[offset], ordered[offset + 1], start_anchor, end_anchor
+            )
+            if page_text is None:
+                page_slices = []
+                break
+            page_slices.append(page_text)
+        if len(page_slices) != page_total:
+            continue
+
+        for offset, page_no in enumerate(range(start_index + 1, end_index + 2)):
+            page_start = ordered[offset]
+            page_end = ordered[offset + 1]
+            manifest[page_no - 1].update({
+                "kind": "body",
+                "status": "多页缺口双锚恢复" if page_total > 1 else "相邻双锁约束",
+                "sourceTitle": unit.title,
+                "sourceUrl": unit.url,
+                "sourceKind": unit.kind,
+                "start": page_start,
+                "end": page_end,
+                "text": page_slices[offset],
+                "confidence": max(75, min(int(previous.get("confidence") or 0), int(following.get("confidence") or 0)) - 5),
+                "reason": "连续缺口由前后同一来源正文锚点夹定，且缺口内每页页边证据形成单调边界。",
+                "adjacentVerified": True,
+            })
+            recovered += 1
+    return recovered
+
+
+def item_source_key(item: dict | None) -> str:
+    return str((item or {}).get("sourceUrl") or (item or {}).get("sourceTitle") or "")
+
+
+def chapter_title_score(unit: SourceUnit, anchor_text: str) -> int:
+    anchor_norm, _ = normalize_for_match(anchor_text)
+    if not anchor_norm:
+        return 0
+    title_norm, _ = normalize_for_match(unit.title)
+    candidates = [title_norm]
+    tail = re.split(r"[#/]", unit.title)[-1]
+    tail_norm, _ = normalize_for_match(tail)
+    candidates.append(tail_norm)
+    for candidate in candidates:
+        if len(candidate) >= 3 and candidate in anchor_norm:
+            return 35
+    return 0
+
+
+def chapter_boundary_evidence(
+    job: dict,
+    reader: PdfReader,
+    page_no: int,
+    layout: str,
+    unit: SourceUnit,
+    start: int,
+    end: int,
+) -> tuple[int, list[tuple[str, int, int, int]]]:
+    start_anchor, end_anchor = page_anchor_pair(job, reader, page_no, layout)
+    hits = bounded_page_anchor_hits(job, reader, page_no, layout, unit, start, end)
+    hit_score = max((hit[3] for hit in hits), default=0)
+    score = 15
+    if hits:
+        score += 45 if len({hit[0] for hit in hits}) == 1 else 60
+    score += chapter_title_score(unit, f"{start_anchor}\n{end_anchor}")
+    return min(100, max(score, hit_score)), hits
+
+
+def recover_chapter_side_pages(
+    job: dict,
+    reader: PdfReader,
+    manifest: list[dict],
+    layout: str,
+    pages: list[int],
+    unit: SourceUnit,
+    source_start: int,
+    source_end: int,
+    status: str,
+) -> int:
+    page_total = len(pages)
+    if not pages or source_end <= source_start or source_end - source_start > max(5000, 1800 * page_total):
+        return 0
+    source_norm, mapping = normalize_source_cached(unit.text)
+    if not source_norm or not mapping:
+        return 0
+    boundaries: dict[int, int] = {0: source_start, page_total: source_end}
+    page_scores = []
+    for offset, page_no in enumerate(pages):
+        score, hits = chapter_boundary_evidence(job, reader, page_no, layout, unit, source_start, source_end)
+        page_scores.append(score)
+        start_hits = [hit for hit in hits if hit[0] == "start"]
+        end_hits = [hit for hit in hits if hit[0] == "end"]
+        if start_hits and offset > 0:
+            boundaries[offset] = min(hit[1] for hit in start_hits)
+        if end_hits and offset + 1 < page_total:
+            boundaries[offset + 1] = max(hit[2] for hit in end_hits)
+    if min(page_scores, default=0) < 50:
+        return 0
+    if any(index not in boundaries for index in range(page_total + 1)):
+        return 0
+    ordered = [boundaries[index] for index in range(page_total + 1)]
+    if any(right <= left for left, right in zip(ordered, ordered[1:])):
+        return 0
+    page_slices = []
+    for offset, page_no in enumerate(pages):
+        start_anchor, end_anchor = page_anchor_pair(job, reader, page_no, layout)
+        page_text = strict_page_text_from_edges(
+            unit.text, mapping, ordered[offset], ordered[offset + 1], start_anchor, end_anchor
+        )
+        if page_text is None:
+            return 0
+        page_slices.append(page_text)
+    for offset, page_no in enumerate(pages):
+        start = ordered[offset]
+        end = ordered[offset + 1]
+        manifest[page_no - 1].update({
+            "kind": "body",
+            "status": status,
+            "sourceTitle": unit.title,
+            "sourceUrl": unit.url,
+            "sourceKind": unit.kind,
+            "start": start,
+            "end": end,
+            "text": page_slices[offset],
+            "confidence": max(78, min(94, page_scores[offset])),
+            "reason": "章节过渡页由 EPUB 章节顺序、章节标题或页边证据共同约束，未发生章节回跳。",
+            "adjacentVerified": True,
+        })
+    return len(pages)
+
+
+def recover_chapter_transition_runs(
+    job: dict,
+    reader: PdfReader,
+    manifest: list[dict],
+    layout: str,
+    units: list[SourceUnit],
+    unit_indexes: dict[str, int],
+) -> int:
+    recovered = 0
+    for start_index, end_index in unresolved_runs(manifest):
+        if any(manifest[index].get("status") in STRICT_BOUNDARY_BLOCK_STATUSES for index in range(start_index, end_index + 1)):
+            continue
+        if start_index == 0 or end_index + 1 >= len(manifest):
+            continue
+        previous = manifest[start_index - 1]
+        following = manifest[end_index + 1]
+        previous_index = unit_indexes.get(item_source_key(previous))
+        following_index = unit_indexes.get(item_source_key(following))
+        if (
+            previous.get("kind") != "body"
+            or following.get("kind") != "body"
+            or previous_index is None
+            or following_index is None
+            or following_index != previous_index + 1
+        ):
+            continue
+        previous_unit = units[previous_index]
+        following_unit = units[following_index]
+        first_page = start_index + 1
+        last_page = end_index + 1
+
+        previous_start = int(previous.get("end") or 0)
+        previous_end = len(normalize_source_cached(previous_unit.text)[0])
+        previous_scores = [
+            page_no for page_no in range(first_page, last_page + 1)
+            if chapter_boundary_evidence(job, reader, page_no, layout, previous_unit, previous_start, previous_end)[0] >= 50
+        ]
+        previous_cluster = edge_evidence_cluster(previous_scores, first_page, last_page, "start")
+
+        following_start = 0
+        following_end = int(following.get("start") or 0)
+        following_scores = [
+            page_no for page_no in range(first_page, last_page + 1)
+            if chapter_boundary_evidence(job, reader, page_no, layout, following_unit, following_start, following_end)[0] >= 50
+        ]
+        following_cluster = edge_evidence_cluster(following_scores, first_page, last_page, "end")
+
+        previous_last = max(previous_cluster) if previous_cluster else first_page - 1
+        following_first = min(following_cluster) if following_cluster else last_page + 1
+        if previous_last >= following_first:
+            continue
+        if previous_cluster:
+            recovered += recover_chapter_side_pages(
+                job, reader, manifest, layout, previous_cluster, previous_unit,
+                previous_start, previous_end, "章节过渡前章约束",
+            )
+        if following_cluster:
+            recovered += recover_chapter_side_pages(
+                job, reader, manifest, layout, following_cluster, following_unit,
+                following_start, following_end, "章节过渡后章约束",
+            )
+    return recovered
 
 
 def bounded_page_anchor_hits(
@@ -2872,6 +3922,8 @@ def mark_source_omitted_pages(
             run_start = None
 
     for start_index, end_index in runs:
+        if any(manifest[index].get("status") in STRICT_BOUNDARY_BLOCK_STATUSES for index in range(start_index, end_index + 1)):
+            continue
         previous = manifest[start_index - 1] if start_index else None
         following = manifest[end_index + 1] if end_index + 1 < len(manifest) else None
         previous_key = str((previous or {}).get("sourceUrl") or (previous or {}).get("sourceTitle") or "")
@@ -2889,58 +3941,17 @@ def mark_source_omitted_pages(
         if not (is_leading or is_trailing or is_transition):
             continue
 
-        first_page = start_index + 1
-        last_page = end_index + 1
-        previous_cluster: list[int] = []
-        following_cluster: list[int] = []
         previous_accounted = is_leading
         following_accounted = is_trailing
-        previous_range = None
-        following_range = None
-
         if previous_unit_index is not None:
-            unit = units[previous_unit_index]
-            source_norm, _ = normalize_source_cached(unit.text)
-            low = int((previous or {}).get("end") or 0)
-            high = len(source_norm)
-            previous_range = (unit, low, high)
-            if high <= low:
-                previous_accounted = True
-            else:
-                evidence = [
-                    page_no for page_no in range(first_page, last_page + 1)
-                    if bounded_page_anchor_hits(job, reader, page_no, layout, unit, low, high)
-                ]
-                previous_cluster = edge_evidence_cluster(evidence, first_page, last_page, "start")
-                previous_accounted = bool(previous_cluster)
-
+            previous_norm, _ = normalize_source_cached(units[previous_unit_index].text)
+            previous_accounted = int((previous or {}).get("end") or 0) == len(previous_norm)
         if following_unit_index is not None:
-            unit = units[following_unit_index]
-            high = int((following or {}).get("start") or 0)
-            following_range = (unit, 0, high)
-            if high <= 0:
-                following_accounted = True
-            else:
-                evidence = [
-                    page_no for page_no in range(first_page, last_page + 1)
-                    if bounded_page_anchor_hits(job, reader, page_no, layout, unit, 0, high)
-                ]
-                following_cluster = edge_evidence_cluster(evidence, first_page, last_page, "end")
-                following_accounted = bool(following_cluster)
-
+            following_accounted = int((following or {}).get("start") or 0) == 0
         if not previous_accounted or not following_accounted:
             continue
-        previous_edge = max(previous_cluster) if previous_cluster else first_page - 1
-        following_edge = min(following_cluster) if following_cluster else last_page + 1
-        if previous_edge >= following_edge:
-            continue
 
-        if len(previous_cluster) == 1 and previous_range:
-            set_boundary_body_page(manifest[previous_cluster[0] - 1], *previous_range)
-        if len(following_cluster) == 1 and following_range:
-            set_boundary_body_page(manifest[following_cluster[0] - 1], *following_range)
-
-        for page_no in range(previous_edge + 1, following_edge):
+        for page_no in range(start_index + 1, end_index + 2):
             manifest[page_no - 1].update({
                 "kind": "source-omitted",
                 "status": "来源未收录",
@@ -2948,8 +3959,103 @@ def mark_source_omitted_pages(
                 "confidence": 100,
                 "sourceTitle": "",
                 "sourceUrl": "",
-                "reason": "该页位于相邻权威正文边界之外，来源 EPUB 未收录；保留原扫描画面并留空文字层。",
+                "sourceAbsentVerified": True,
+                "reason": "该页位于相邻权威正文边界之外，已确认来源 EPUB 未收录。",
             })
+
+
+def fill_source_omitted_ocr(
+    job: dict,
+    manifest: list[dict],
+    layout: str,
+    status_job_id: str = "",
+) -> int:
+    """Use same-page OCR only after source absence has been proven by strict boundaries."""
+    candidates = [item for item in manifest if item.get("kind") == "source-omitted" and item.get("sourceAbsentVerified")]
+    if not candidates:
+        return 0
+    by_page = {int(item.get("page") or 0): item for item in candidates if int(item.get("page") or 0) > 0}
+    completed = 0
+    finished = 0
+    cached = 0
+    work_started = time.time()
+
+    def apply_text(page_no: int, text: str) -> None:
+        nonlocal completed, finished
+        item = by_page[page_no]
+        if text.strip():
+            item.update({
+                "status": "来源未收录·整页 OCR",
+                "text": text,
+                "confidence": 70,
+                "sourceTitle": "本页 OCR",
+                "textOrigin": "page-ocr",
+                "reason": "权威来源已确认未收录该页；文字层使用本 PDF 页的整页 OCR，不参与权威正文对齐。",
+            })
+            completed += 1
+        finished += 1
+
+    pending_pages = []
+    for page_no in sorted(by_page):
+        cache_path = full_ocr_cache_path(job, page_no, layout)
+        if cache_path.exists():
+            apply_text(page_no, ocr_page_text(job, page_no, layout, anchors_only=False))
+            cached += 1
+        else:
+            pending_pages.append(page_no)
+
+    worker_count = adaptive_ocr_workers(3)
+
+    def report(page_no: int, force: bool = False) -> None:
+        if status_job_id and (force or finished == 1 or finished % 5 == 0 or finished == len(by_page)):
+            update_pipeline_stage(
+                status_job_id,
+                "classify",
+                "running",
+                state="planning",
+                processed=finished,
+                total=len(by_page),
+                currentPage=page_no,
+                detail=f"来源未收录页 OCR {finished} / {len(by_page)}（{worker_count} 路）",
+                metrics=throughput_metrics(
+                    work_started, max(0, finished - cached), max(1, len(pending_pages)),
+                    workers=worker_count, cachedPages=cached, newlyOcrPages=max(0, finished - cached),
+                    renderDpi=160,
+                ),
+                message=f"正在为已确认来源未收录的页面写入本页 OCR：{finished} / {len(by_page)}。",
+            )
+
+    if cached:
+        report(max(page for page in by_page if full_ocr_cache_path(job, page, layout).exists()), force=True)
+    if len(pending_pages) == 1:
+        page_no = pending_pages[0]
+        text = ocr_page_text(job, page_no, layout, anchors_only=False)
+        apply_text(page_no, text)
+        report(page_no, force=True)
+    elif pending_pages:
+        with concurrent.futures.ProcessPoolExecutor(max_workers=worker_count) as pool:
+            futures = {
+                pool.submit(full_page_ocr_worker, (str(job.get("id") or ""), page_no, layout)): page_no
+                for page_no in pending_pages
+            }
+            for future in concurrent.futures.as_completed(futures):
+                page_no, text, error = future.result()
+                if error:
+                    for pending in futures:
+                        pending.cancel()
+                    raise RuntimeError(f"第 {page_no} 页整页 OCR 失败：{error}")
+                apply_text(page_no, text)
+                report(page_no)
+                if status_job_id and read_full_status(status_job_id).get("pauseRequested"):
+                    for pending in futures:
+                        pending.cancel()
+                    update_pipeline_stage(
+                        status_job_id, "classify", "paused", state="paused",
+                        processed=finished, total=len(by_page), detail="已完成结果和 OCR 缓存均已保留",
+                        pauseRequested=False,
+                    )
+                    raise TaskPaused()
+    return completed
 
 
 def page_text_for_full(reader: PdfReader, job: dict, page_no: int, segments: list[str] | None, manifest: list[dict] | None = None) -> str:
@@ -2966,13 +4072,7 @@ def overlay_for_page(page, text: str, blocks: list[dict], layout: str, image_siz
     packet = io.BytesIO()
     width, height = float(page.mediabox.width), float(page.mediabox.height)
     overlay_canvas = canvas.Canvas(packet, pagesize=(width, height), pageCompression=1)
-    if layout == "horizontal":
-        draw_horizontal_text(overlay_canvas, text, width, height)
-    else:
-        image_w, image_h = image_size or (round(width), round(height))
-        draw_vertical_text(overlay_canvas, text, blocks, width, height, image_w, image_h)
-    if SEARCH_ALIASES_ENABLED:
-        draw_search_aliases(overlay_canvas, text, blocks, image_size)
+    draw_word_style_authoritative_text(overlay_canvas, text, width, height, layout)
     overlay_canvas.showPage()
     overlay_canvas.save()
     packet.seek(0)
@@ -2995,6 +4095,21 @@ def read_full_status(job_id: str) -> dict:
         "message": "尚未开始整本任务。",
         "outputs": [],
     }
+
+
+def completed_output_is_current(job_id: str, layout: str) -> bool:
+    paths = job_paths(job_id)
+    if not paths.meta.exists():
+        return False
+    job = json.loads(paths.meta.read_text(encoding="utf-8"))
+    selected_layout = layout if layout != "auto" else job.get("layout", "vertical-double")
+    status = read_full_status(job_id)
+    return bool(
+        status.get("state") == "done"
+        and status.get("engineVersion") == LAYOUT_ENGINE_VERSION
+        and status.get("outputLayout") == selected_layout
+        and (paths.root / "text-positioned-full.pdf").is_file()
+    )
 
 
 def write_full_status(job_id: str, **updates) -> dict:
@@ -3048,10 +4163,18 @@ def update_pipeline_stage(job_id: str, stage_id: str, stage_state: str, **update
         if stage is None:
             raise ValueError(f"未知后台阶段：{stage_id}")
         now = time.time()
-        if stage_state == "running" and not stage.get("startedAt"):
+        previous_stage_state = str(stage.get("state") or "")
+        if stage_state == "running" and previous_stage_state != "running":
+            stage["startedAt"] = now
+            stage.pop("endedAt", None)
+            stage.pop("elapsedSeconds", None)
+        elif stage_state == "running" and not stage.get("startedAt"):
             stage["startedAt"] = now
         if stage_state in {"done", "blocked", "error", "paused"}:
-            stage.setdefault("startedAt", now)
+            if previous_stage_state != "running":
+                stage["startedAt"] = now
+            else:
+                stage.setdefault("startedAt", now)
             stage["endedAt"] = now
         stage["state"] = stage_state
         for key in ("processed", "total"):
@@ -3146,24 +4269,34 @@ def cleanup_old_cache(days: int = 7) -> dict:
                 continue
         except OSError:
             continue
-        job_id = job_root.name
+        job_id = job_id_from_root(job_root)
+        if not job_id:
+            continue
         removed += cleanup_job_cache(job_id, keep_final=True).get("removed", 0)
     return {"removed": removed}
 
 
 def manifest_summary(manifest: list[dict] | None, page_count: int) -> dict:
     if not manifest:
-        return {"matched": 0, "constrained": 0, "ocr": 0, "blank": 0, "sourceOmitted": 0, "unresolved": page_count, "estimated": 0, "warnings": 0, "reviewRequired": page_count, "averageConfidence": 0}
-    matched_statuses = {"双头锁边", "双锁连续去重", "双锁连续补首", "全文 OCR 边界校准"}
-    constrained_statuses = {"相邻双锁约束", "章节边界约束", "页首锁边", "页尾锁边"}
+        return {"matched": 0, "constrained": 0, "ocr": 0, "blank": 0, "sourceOmitted": 0, "sourceOmittedOcr": 0, "unresolved": page_count, "estimated": 0, "warnings": 0, "boundaryReview": 0, "reviewRequired": page_count, "averageConfidence": 0}
+    matched_statuses = {"双头锁边", "跨章节双头锁边", "全文 OCR 边界校准"}
+    constrained_statuses = {
+        "相邻双锁约束", "章节边界约束", "多页缺口双锚恢复",
+        "章节过渡前章约束", "章节过渡后章约束", "页首锁边", "页尾锁边",
+    }
     matched = sum(1 for item in manifest if item.get("kind") == "body" and item.get("status") in matched_statuses)
     constrained = sum(1 for item in manifest if item.get("kind") == "body" and item.get("status") in constrained_statuses)
     ocr_pages = sum(1 for item in manifest if item.get("kind") == "ocr")
     blank_pages = sum(1 for item in manifest if item.get("kind") == "blank")
     source_omitted = sum(1 for item in manifest if item.get("kind") == "source-omitted")
+    source_omitted_ocr = sum(
+        1 for item in manifest
+        if item.get("kind") == "source-omitted" and item.get("textOrigin") == "page-ocr"
+    )
     unresolved = sum(1 for item in manifest if item.get("kind") == "unresolved")
     estimated = sum(1 for item in manifest if item.get("status") in {"连续估算", "估算"})
     warnings = sum(1 for item in manifest if item.get("continuityWarning"))
+    boundary_review = sum(1 for item in manifest if item.get("status") in {"双锁连续去重", "双锁连续补首"})
     scores = [int(item.get("confidence") or 0) for item in manifest]
     average = round(sum(scores) / max(1, len(scores)))
     return {
@@ -3172,12 +4305,42 @@ def manifest_summary(manifest: list[dict] | None, page_count: int) -> dict:
         "ocr": ocr_pages,
         "blank": blank_pages,
         "sourceOmitted": source_omitted,
+        "sourceOmittedOcr": source_omitted_ocr,
         "unresolved": unresolved,
         "estimated": estimated,
         "warnings": warnings,
-        "reviewRequired": unresolved + estimated + warnings + ocr_pages,
+        "boundaryReview": boundary_review,
+        "reviewRequired": unresolved + estimated + warnings + ocr_pages + boundary_review,
         "averageConfidence": average,
     }
+
+
+def alignment_review_count(alignment: dict | None) -> int:
+    alignment = alignment or {}
+    return int(alignment.get("reviewRequired") or alignment.get("unresolved") or 0)
+
+
+def alignment_locked_count(alignment: dict | None) -> int:
+    alignment = alignment or {}
+    return int(alignment.get("matched") or 0) + int(alignment.get("constrained") or 0)
+
+
+def alignment_quality_regressed(current: dict, previous: dict | None, page_count: int) -> bool:
+    """Refuse to silently replace a materially better page alignment result."""
+    if not previous:
+        return False
+    previous_review = alignment_review_count(previous)
+    current_review = alignment_review_count(current)
+    previous_locked = alignment_locked_count(previous)
+    current_locked = alignment_locked_count(current)
+    if previous_review <= 0 and previous_locked <= 0:
+        return False
+    review_slack = max(50, round(page_count * 0.05))
+    locked_slack = max(50, round(page_count * 0.03))
+    return (
+        current_review > previous_review + review_slack
+        and current_locked < previous_locked - locked_slack
+    )
 
 
 def write_alignment_issues(job_id: str, manifest: list[dict]) -> Path:
@@ -3185,6 +4348,7 @@ def write_alignment_issues(job_id: str, manifest: list[dict]) -> Path:
     rows = [
         item for item in manifest
         if item.get("kind") in {"unresolved", "ocr"}
+        or item.get("status") in {"双锁连续去重", "双锁连续补首"}
         or item.get("status") in {"连续估算", "估算"}
         or item.get("continuityWarning")
     ]
@@ -3256,13 +4420,157 @@ def validate_page_text_layer(pdf_path: Path, expected_text: str) -> int:
     if len(reader.pages) != 1:
         raise ValueError("中间页文件页数异常，已停止整本输出。")
     extracted = reader.pages[0].extract_text() or ""
-    extracted_norm, _ = normalize_for_match(extracted)
+    extracted_norm = canonical_output_text(extracted)
     expected_norm = expected_text_layer_norm(expected_text)
     if extracted_norm != expected_norm:
         raise ValueError("中间页文字层与锁定正文不一致，已停止整本输出。")
     if re.search(r"(?:U\+[0-9A-Fa-f]{4,6}){2,}", extracted):
         raise ValueError("中间页文字层出现编码串，已停止整本输出。")
     return len(extracted_norm)
+
+
+def page_layer_signature(row: dict, layout: str) -> str:
+    payload = {
+        "engineVersion": LAYOUT_ENGINE_VERSION,
+        "layout": layout,
+        "page": int(row.get("page") or 0),
+        "kind": str(row.get("kind") or ""),
+        "text": str(row.get("text") or ""),
+    }
+    return hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+
+
+def page_layer_cache_valid(page_out: Path, signature_path: Path, signature: str, expected_text: str) -> bool:
+    if not page_out.is_file() or not signature_path.is_file():
+        return False
+    try:
+        if signature_path.read_text(encoding="ascii").strip() != signature:
+            return False
+        validate_page_text_layer(page_out, expected_text)
+        return True
+    except Exception:
+        return False
+
+
+def write_page_layer(
+    reader: PdfReader,
+    page_no: int,
+    row: dict,
+    layout: str,
+    page_out: Path,
+) -> bool:
+    signature = page_layer_signature(row, layout)
+    signature_path = page_out.with_suffix(".sha256")
+    text = str(row.get("text") or "")
+    if page_layer_cache_valid(page_out, signature_path, signature, text):
+        return False
+    writer = PdfWriter()
+    writer.add_page(reader.pages[page_no - 1])
+    page = writer.pages[0]
+    image_size = None
+    blocks = []
+    if layout != "horizontal":
+        width = float(page.mediabox.width)
+        height = float(page.mediabox.height)
+        blocks, image_size = stable_vertical_blocks(width, height, layout)
+    remove_text(page, writer)
+    overlay = overlay_for_page(page, text, blocks, layout, image_size)
+    page.merge_page(overlay)
+    write_pdf_atomic(writer, page_out)
+    validate_page_text_layer(page_out, text)
+    atomic_write_text(signature_path, signature)
+    return True
+
+
+def build_review_pdf(job_id: str, layout: str = "auto") -> dict:
+    """Build a clearly labeled inspection draft without relaxing the release gate."""
+    paths = job_paths(job_id)
+    job = json.loads(paths.meta.read_text(encoding="utf-8"))
+    selected_layout = layout if layout != "auto" else job.get("layout", "vertical-double")
+    manifest_path = paths.root / "page-text-manifest.json"
+    if not manifest_path.exists():
+        raise ValueError("尚未生成逐页核对清单，无法制作核对预览。")
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest = payload.get("pages") if isinstance(payload, dict) else payload
+    if not isinstance(manifest, list):
+        raise ValueError("逐页核对清单格式无效。")
+    reader = PdfReader(str(paths.pdf), strict=False)
+    page_count = len(reader.pages)
+    if len(manifest) != page_count:
+        raise ValueError("核对清单页数与扫描 PDF 不一致。")
+
+    review_dir = paths.root / "review-pages"
+    review_dir.mkdir(parents=True, exist_ok=True)
+    draft_path = paths.root / f"{book_package_slug(str(job.get('pdfOriginal') or 'book'))}-review-draft.pdf"
+    confirmed = 0
+    page_files = []
+    for page_no, row in enumerate(manifest, start=1):
+        page_out = review_dir / f"page-{page_no:05d}.pdf"
+        scan_marker = page_out.with_suffix(".scan-only")
+        text = str(row.get("text") or "")
+        if row.get("kind") != "unresolved" and text:
+            write_page_layer(reader, page_no, row, selected_layout, page_out)
+            scan_marker.unlink(missing_ok=True)
+            confirmed += 1
+        elif not page_out.exists() or not scan_marker.exists():
+            writer = PdfWriter()
+            writer.add_page(reader.pages[page_no - 1])
+            remove_text(writer.pages[0], writer)
+            write_pdf_atomic(writer, page_out)
+            page_out.with_suffix(".sha256").unlink(missing_ok=True)
+            atomic_write_text(scan_marker, "scan-only-v1")
+        page_files.append(page_out)
+        if page_no == 1 or page_no % 10 == 0 or page_no == page_count:
+            status = read_full_status(job_id)
+            pipeline = status.get("pipeline") or []
+            review_stage = next((item for item in pipeline if item.get("id") == "review"), None)
+            if review_stage:
+                review_stage.update(
+                    state="running",
+                    processed=page_no,
+                    total=page_count,
+                    detail=f"已整理 {page_no} / {page_count} 页核对预览",
+                )
+            write_full_status(
+                job_id,
+                state="reviewing",
+                activeStage="review",
+                processed=page_no,
+                total=page_count,
+                message=f"正在生成核对预览 {page_no} / {page_count}。",
+                pipeline=pipeline,
+            )
+    assemble_page_pdfs(page_files, draft_path)
+    if len(PdfReader(str(draft_path), strict=False).pages) != page_count:
+        raise ValueError("核对预览页数异常，已停止输出。")
+
+    status = read_full_status(job_id)
+    pipeline = status.get("pipeline") or []
+    review_stage = next((item for item in pipeline if item.get("id") == "review"), None)
+    if review_stage:
+        review_stage.update(
+            state="done",
+            processed=page_count,
+            total=page_count,
+            detail=f"核对预览完成；含 {confirmed} 页已确认文字层",
+        )
+    issue_report = paths.root / "alignment-issues.csv"
+    outputs = []
+    if issue_report.exists():
+        outputs.append(make_output_link(job_id, issue_report, "待核对页清单", "CSV"))
+    outputs.append(make_output_link(job_id, draft_path, "整本核对预览（非正式成品）", "PDF · 未确认页仅保留扫描图"))
+    return write_full_status(
+        job_id,
+        state="error",
+        activeStage="align",
+        processed=page_count,
+        total=page_count,
+        message=f"核对预览已生成：{confirmed} 页含已确认文字层，其余页面仅保留扫描图；正式发布门禁仍未通过。",
+        outputs=outputs,
+        pipeline=pipeline,
+    )
 
 
 def validate_full_output(source_pdf: Path, output_pdf: Path, manifest: list[dict], status_job_id: str = "") -> dict:
@@ -3278,14 +4586,18 @@ def validate_full_output(source_pdf: Path, output_pdf: Path, manifest: list[dict
             message="整本已合并，正在验证连续搜索和复制文字。",
         )
     extracted_chars = 0
+    extracted_stream = hashlib.sha256()
+    expected_stream = hashlib.sha256()
     for index, row in enumerate(manifest):
         extracted = output_reader.pages[index].extract_text() or ""
-        extracted_norm, _ = normalize_for_match(extracted)
+        extracted_norm = canonical_output_text(extracted)
         expected_norm = expected_text_layer_norm(str(row.get("text") or ""))
         if extracted_norm != expected_norm:
             raise ValueError(f"第 {index + 1} 页复制文字与锁定正文不一致，已停止发布。")
         if re.search(r"(?:U\+[0-9A-Fa-f]{4,6}){2,}", extracted):
             raise ValueError(f"第 {index + 1} 页出现编码串，已停止发布。")
+        extracted_stream.update(extracted_norm.encode("utf-8"))
+        expected_stream.update(expected_norm.encode("utf-8"))
         extracted_chars += len(extracted_norm)
         if status_job_id and ((index + 1) % 50 == 0 or index + 1 == page_count):
             update_pipeline_stage(
@@ -3293,11 +4605,14 @@ def validate_full_output(source_pdf: Path, output_pdf: Path, manifest: list[dict
                 processed=index + 1, total=page_count, detail=f"已验证第 {index + 1} 页",
             )
 
+    continuous_text_hash = extracted_stream.hexdigest()
+    if continuous_text_hash != expected_stream.hexdigest():
+        raise ValueError("整本连续文字流与逐页权威正文顺序不一致，已停止发布。")
     if status_job_id:
         update_pipeline_stage(
             status_job_id, "text-check", "done", state="running",
             processed=page_count, total=page_count, detail=f"文字层一致，共 {extracted_chars} 个检索字符",
-            metrics={"extractedChars": extracted_chars},
+            metrics={"extractedChars": extracted_chars, "continuousTextHash": continuous_text_hash},
         )
 
     visual_pages = set(sample_pages(page_count))
@@ -3329,7 +4644,12 @@ def validate_full_output(source_pdf: Path, output_pdf: Path, manifest: list[dict
             processed=checked, total=len(pages_to_check), detail=f"{checked} 个关键页像素一致",
             metrics={"pixelCheckedPages": checked},
         )
-    return {"pages": page_count, "extractedChars": extracted_chars, "pixelCheckedPages": checked}
+    return {
+        "pages": page_count,
+        "extractedChars": extracted_chars,
+        "continuousTextHash": continuous_text_hash,
+        "pixelCheckedPages": checked,
+    }
 
 
 def build_full_pdf(job_id: str, layout: str, stop_after: int | None = None) -> dict:
@@ -3342,32 +4662,149 @@ def build_full_pdf(job_id: str, layout: str, stop_after: int | None = None) -> d
     page_dir = paths.root / "pages"
     page_dir.mkdir(parents=True, exist_ok=True)
     final_pdf = paths.root / "text-positioned-full.pdf"
+    stale_pdf = paths.root / ".text-positioned-full.stale.pdf"
     building_pdf = paths.root / ".text-positioned-full.building.pdf"
     manifest_path = paths.root / "page-text-manifest.json"
     calibration = job.get("calibration") or {}
     if not calibration:
         raise ValueError("请先试一页并达到精准锁定，再生成整本。")
+    if final_pdf.exists():
+        stale_pdf.unlink(missing_ok=True)
+        os.replace(final_pdf, stale_pdf)
     update_pipeline_stage(
         job_id, "input", "done", state="planning",
         processed=1, total=1, detail=f"PDF {page_count} 页，EPUB {int(job.get('sourceUnitCount') or 0)} 个内容单元",
         message="PDF 与权威来源检查完成。",
     )
-    manifest = (
-        build_strict_page_manifest(job, reader, selected_layout, status_job_id=job_id)
-        if STRICT_MANIFEST_ENABLED
-        else build_fast_authoritative_manifest(job, reader, selected_layout, status_job_id=job_id)
+    ensure_text_font()
+    streamed_pages: set[int] = set()
+    verified_pages: set[int] = set()
+    update_pipeline_stage(
+        job_id,
+        "layer",
+        "waiting",
+        state="planning",
+        processed=0,
+        total=page_count,
+        detail="等待相邻页反向确认与全书边界恢复",
+        metrics={"streamedPages": 0, "waitingForFinalAlignment": True},
     )
+
+    def commit_stream_page(page_no: int, row: dict) -> None:
+        page_out = page_dir / f"page-{page_no:05d}.pdf"
+        write_page_layer(reader, page_no, row, selected_layout, page_out)
+        streamed_pages.add(page_no)
+        verified_pages.add(page_no)
+        if len(streamed_pages) == 1 or len(streamed_pages) % 10 == 0:
+            update_pipeline_stage(
+                job_id,
+                "layer",
+                "waiting",
+                state="planning",
+                processed=len(streamed_pages),
+                total=page_count,
+                currentPage=page_no,
+                detail=f"已安全预写 {len(streamed_pages)} 页；其余页面等待全书边界恢复",
+                metrics={"streamedPages": len(streamed_pages), "waitingForFinalAlignment": True},
+                message="OCR、严格对齐和已确认页面写入正在并行推进。",
+            )
+
+    manifest = None
+    manifest_reused = False
+    cached_payload = None
+    cached_pages = None
+    cached_summary = None
+    previous_status = read_full_status(job_id)
+    previous_alignment = previous_status.get("previousAlignment") or previous_status.get("alignment") or {}
+    if manifest_path.exists():
+        try:
+            cached_payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+            cached_pages = cached_payload.get("pages") if isinstance(cached_payload, dict) else None
+            if (
+                isinstance(cached_pages, list)
+                and len(cached_pages) == page_count
+                and cached_payload.get("layout") == selected_layout
+                and cached_payload.get("inputFingerprint") == job.get("inputFingerprint")
+            ):
+                cached_summary = manifest_summary(cached_pages, page_count)
+            if (
+                isinstance(cached_pages, list)
+                and len(cached_pages) == page_count
+                and cached_payload.get("engineVersion") == LAYOUT_ENGINE_VERSION
+                and cached_payload.get("layout") == selected_layout
+                and cached_payload.get("inputFingerprint") == job.get("inputFingerprint")
+            ):
+                manifest = cached_pages
+                manifest_reused = True
+        except (OSError, json.JSONDecodeError):
+            pass
+    if manifest is None:
+        manifest = (
+            build_strict_page_manifest(
+                job,
+                reader,
+                selected_layout,
+                status_job_id=job_id,
+                commit_callback=commit_stream_page,
+            )
+            if STRICT_MANIFEST_ENABLED
+            else build_fast_authoritative_manifest(job, reader, selected_layout, status_job_id=job_id)
+        )
     for row in manifest:
         if row.get("kind") != "body" or not row.get("text"):
             continue
-        page_no = int(row.get("page") or 0)
-        scan_sample = "\n".join(ocr_page_anchor_pair(job, page_no, selected_layout))
-        row["text"], script_note = adapt_text_to_scan_script(str(row["text"]), scan_sample)
-        row["text"] = searchable_safe_text(str(row["text"]))
-        if script_note:
-            row["scriptAdjustment"] = script_note
-    atomic_write_json(manifest_path, {"pages": manifest})
+        row["text"] = str(row["text"])
     alignment = manifest_summary(manifest, page_count)
+    regression_reference = cached_summary if alignment_quality_regressed(alignment, cached_summary, page_count) else None
+    if not regression_reference and alignment_quality_regressed(alignment, previous_alignment, page_count):
+        regression_reference = previous_alignment
+    if not manifest_reused and regression_reference:
+        candidate_path = paths.root / "page-text-manifest-rejected-regression.json"
+        atomic_write_json(candidate_path, {
+            "engineVersion": LAYOUT_ENGINE_VERSION,
+            "inputFingerprint": job.get("inputFingerprint", ""),
+            "layout": selected_layout,
+            "pages": manifest,
+            "alignment": alignment,
+            "previousAlignment": regression_reference,
+            "rejectedReason": "alignment-quality-regression",
+        })
+        if cached_payload is not None:
+            atomic_write_json(manifest_path, cached_payload)
+        write_full_status(
+            job_id,
+            state="error",
+            activeStage="align",
+            processed=page_count,
+            total=page_count,
+            message=(
+                "新一轮严格核对结果明显差于已保存结果，已阻止覆盖正式清单。"
+                f" 当前待核对 {alignment_review_count(alignment)} 页，上一结果待核对 {alignment_review_count(regression_reference)} 页。"
+            ),
+            alignment=regression_reference,
+            validation={"qualityRegressionBlocked": True, "candidateManifest": candidate_path.name},
+            outputs=[],
+        )
+        return
+    atomic_write_json(manifest_path, {
+        "engineVersion": LAYOUT_ENGINE_VERSION,
+        "inputFingerprint": job.get("inputFingerprint", ""),
+        "layout": selected_layout,
+        "pages": manifest,
+    })
+    if manifest_reused:
+        unresolved = int(alignment.get("reviewRequired") or alignment.get("unresolved") or 0)
+        locked = int(alignment.get("matched") or 0) + int(alignment.get("constrained") or 0)
+        update_pipeline_stage(
+            job_id, "ocr", "done", state="planning",
+            processed=page_count, total=page_count, detail="页边 OCR 缓存未变化，直接复用",
+        )
+        update_pipeline_stage(
+            job_id, "align", "blocked" if unresolved else "done", state="planning",
+            processed=page_count, total=page_count,
+            detail=f"已复用严格核对清单：锁定 {locked} 页，待核对 {unresolved} 页",
+            metrics={"manifestReused": True, "locked": locked, "unresolved": unresolved},
+        )
     blockers = []
     if alignment["unresolved"] and not ALLOW_UNRESOLVED_OUTPUT:
         blockers.append(f"{alignment['unresolved']} 页未锁定")
@@ -3377,8 +4814,21 @@ def build_full_pdf(job_id: str, layout: str, stop_after: int | None = None) -> d
         blockers.append(f"{alignment['ocr']} 页只有 OCR 文字")
     if alignment["warnings"] and not ALLOW_UNRESOLVED_OUTPUT:
         blockers.append(f"{alignment['warnings']} 处连续性警告")
+    if alignment["boundaryReview"] and not ALLOW_UNRESOLVED_OUTPUT:
+        blockers.append(f"{alignment['boundaryReview']} 页旧式页界结果待复核")
     if blockers:
         issue_report = write_alignment_issues(job_id, manifest)
+        if streamed_pages:
+            update_pipeline_stage(
+                job_id,
+                "layer",
+                "paused",
+                state="planning",
+                processed=len(streamed_pages),
+                total=page_count,
+                detail=f"已安全预写 {len(streamed_pages)} 页；严格门禁未通过，未合并发布",
+                metrics={"streamedPages": len(streamed_pages), "published": False},
+            )
         return write_full_status(
             job_id,
             state="error",
@@ -3406,10 +4856,6 @@ def build_full_pdf(job_id: str, layout: str, stop_after: int | None = None) -> d
         f"{LAYOUT_ENGINE_VERSION}\n{json.dumps(manifest, ensure_ascii=False, sort_keys=True)}".encode("utf-8")
     ).hexdigest()
     build_key_path = paths.root / "build-manifest-hash.txt"
-    previous_hash = build_key_path.read_text(encoding="utf-8").strip() if build_key_path.exists() else ""
-    if previous_hash and previous_hash != manifest_hash:
-        for old_page in page_dir.glob("page-*.pdf"):
-            old_page.unlink(missing_ok=True)
     atomic_write_text(build_key_path, manifest_hash)
 
     cached_pages = len(list(page_dir.glob("page-*.pdf")))
@@ -3426,56 +4872,34 @@ def build_full_pdf(job_id: str, layout: str, stop_after: int | None = None) -> d
         outputs=[],
     )
 
-    ensure_text_font()
+    # Final publication only trusts pages revalidated against the finalized manifest.
+    verified_pages.clear()
     for page_no in range(1, page_count + 1):
         page_out = page_dir / f"page-{page_no:05d}.pdf"
-        if page_out.exists() and page_out.stat().st_size > 0:
-            try:
-                validate_page_text_layer(page_out, str(manifest[page_no - 1].get("text") or ""))
-                continue
-            except Exception:
-                page_out.unlink(missing_ok=True)
-
-        writer = PdfWriter()
-        writer.add_page(reader.pages[page_no - 1])
-        page = writer.pages[0]
         manifest_row = manifest[page_no - 1]
-        text = str(manifest_row.get("text") or "")
-        image_size = None
-        blocks = []
-        if selected_layout == "horizontal":
-            blocks = []
-        else:
-            width = float(page.mediabox.width)
-            height = float(page.mediabox.height)
-            blocks, image_size = stable_vertical_blocks(width, height, selected_layout)
+        write_page_layer(reader, page_no, manifest_row, selected_layout, page_out)
+        verified_pages.add(page_no)
 
-        remove_text(page, writer)
-        overlay = overlay_for_page(page, text, blocks, selected_layout, image_size)
-        page.merge_page(overlay)
-
-        write_pdf_atomic(writer, page_out)
-        validate_page_text_layer(page_out, text)
-
-        update_pipeline_stage(
-            job_id,
-            "layer",
-            "running",
-            state="running",
-            processed=page_no,
-            total=page_count,
-            currentPage=page_no,
-            detail=f"正在写入第 {page_no} 页",
-            message=f"正在整理第 {page_no} / {page_count} 页。",
-            alignment=alignment,
-        )
+        if page_no == 1 or page_no % 10 == 0 or page_no == page_count:
+            update_pipeline_stage(
+                job_id,
+                "layer",
+                "running",
+                state="running",
+                processed=page_no,
+                total=page_count,
+                currentPage=page_no,
+                detail=f"已确认并写入第 {page_no} 页",
+                message=f"正在完成剩余页面 {page_no} / {page_count}。",
+                alignment=alignment,
+            )
         if read_full_status(job_id).get("pauseRequested"):
             break
         if stop_after and page_no >= stop_after:
             break
 
     page_files = [page_dir / f"page-{page_no:05d}.pdf" for page_no in range(1, page_count + 1)]
-    complete = all(path.exists() and path.stat().st_size > 0 for path in page_files)
+    complete = len(verified_pages) == page_count
     if complete:
         update_pipeline_stage(
             job_id, "layer", "done", state="running",
@@ -3497,6 +4921,7 @@ def build_full_pdf(job_id: str, layout: str, stop_after: int | None = None) -> d
             validation = validate_full_output(pdf_path, building_pdf, manifest, status_job_id=job_id)
             validation["assembly"] = assembly_backend
             os.replace(building_pdf, final_pdf)
+            stale_pdf.unlink(missing_ok=True)
         finally:
             building_pdf.unlink(missing_ok=True)
         outputs = [
@@ -3512,6 +4937,8 @@ def build_full_pdf(job_id: str, layout: str, stop_after: int | None = None) -> d
             alignment=alignment,
             validation=validation,
             outputs=outputs,
+            engineVersion=LAYOUT_ENGINE_VERSION,
+            outputLayout=selected_layout,
         )
 
     update_pipeline_stage(
@@ -3539,7 +4966,7 @@ def validate_trial_output(
     image_size: tuple[int, int] | None = None,
 ) -> dict:
     extracted = PdfReader(str(trial_pdf), strict=False).pages[0].extract_text() or ""
-    extracted_norm, _ = normalize_for_match(extracted)
+    extracted_norm = canonical_output_text(extracted)
     expected_norm = expected_text_layer_norm(expected_text)
     if expected_norm and len(extracted_norm) < max(4, round(len(expected_norm) * 0.8)):
         raise ValueError("试页文字层没有完整写入，已停止输出。")
@@ -3551,26 +4978,7 @@ def validate_trial_output(
     trial_image = render_page_image(trial_pdf, 1, dpi=96)
     if source_image.size != trial_image.size or ImageChops.difference(source_image, trial_image).getbbox() is not None:
         raise ValueError("试页画面与原扫描页不一致，已停止输出。")
-    geometry = {}
-    expected_columns = [column for block in (blocks or []) for column in (block.get("ocrColumns") or [])]
-    if expected_columns and image_size:
-        try:
-            import pdfplumber
-            with pdfplumber.open(str(trial_pdf)) as document:
-                pdf_page = document.pages[0]
-                positioned_chars = [char for char in pdf_page.chars if float(char.get("size") or 0) >= 5]
-                actual_x = sorted({round(float(char["x0"]), 1) for char in positioned_chars})
-                expected_x = [float(column["x"]) * pdf_page.width / image_size[0] for column in expected_columns]
-            if abs(len(actual_x) - len(expected_x)) > 1:
-                raise ValueError("试页文字列数与扫描正文列数不一致，已停止输出。")
-            deltas = sorted(min(abs(value - candidate) for candidate in actual_x) for value in expected_x)
-            median_delta = deltas[len(deltas) // 2]
-            if median_delta > 12:
-                raise ValueError("试页文字列没有贴近扫描正文列，已停止输出。")
-            geometry = {"positionedColumns": len(actual_x), "medianColumnDelta": round(median_delta, 2)}
-        except ImportError:
-            geometry = {"positionedColumns": len(expected_columns)}
-    return {"extractedChars": len(extracted_norm), "pixelIdentical": True, **geometry}
+    return {"extractedChars": len(extracted_norm), "pixelIdentical": True, "wordStyleFrame": True}
 
 
 def make_trial(job_id: str, page_no: int, layout: str) -> dict:
@@ -3581,15 +4989,25 @@ def make_trial(job_id: str, page_no: int, layout: str) -> dict:
     page_no = max(1, min(page_no, len(reader_for_count.pages)))
 
     selected_layout = layout if layout != "auto" else job.get("layout", "vertical-double")
+    preview_path = paths.root / f"page-{page_no:04d}-guides.png"
+    trial_pdf = paths.root / f"page-{page_no:04d}-trial.pdf"
+    preview_path.unlink(missing_ok=True)
+    trial_pdf.unlink(missing_ok=True)
     image = render_page_image(pdf_path, page_no)
     blocks = detect_horizontal_block(image) if selected_layout == "horizontal" else detect_vertical_blocks(image, selected_layout)
-    preview_path = paths.root / f"page-{page_no:04d}-guides.png"
 
     reader = PdfReader(str(pdf_path), strict=False)
     resolved = resolve_page(job, reader, page_no, selected_layout, allow_discovery=True)
     if page_no > 1 and resolved.get("kind") == "body":
         previous = resolve_page(job, reader, page_no - 1, selected_layout, allow_discovery=False)
-        resolved = apply_previous_page_continuity(job, previous, resolved)
+        pair = [previous, resolved]
+        enforce_adjacent_page_boundaries(pair)
+        resolved = pair[1]
+    if page_no < len(reader.pages) and resolved.get("kind") == "body":
+        following = resolve_page(job, reader, page_no + 1, selected_layout, allow_discovery=False)
+        pair = [resolved, following]
+        enforce_adjacent_page_boundaries(pair)
+        resolved = pair[0]
     if resolved.get("kind") == "unresolved":
         start_sample = normalize_for_match(str(resolved.get("startAnchor") or ""))[0][:18]
         end_sample = normalize_for_match(str(resolved.get("endAnchor") or ""))[0][-18:]
@@ -3603,12 +5021,6 @@ def make_trial(job_id: str, page_no: int, layout: str) -> dict:
     source_page = writer.pages[0]
     remove_text(source_page, writer)
     text = str(resolved.get("text") or "")
-    if resolved.get("kind") == "body":
-        scan_sample = "\n".join(ocr_page_anchor_pair(job, page_no, selected_layout))
-        text, script_note = adapt_text_to_scan_script(text, scan_sample)
-        text = searchable_safe_text(text)
-        if script_note:
-            resolved["scriptAdjustment"] = script_note
     if not text.strip():
         raise ValueError("这一页没有得到可写入的文字，已停止生成。")
     if selected_layout != "horizontal":
@@ -3617,17 +5029,12 @@ def make_trial(job_id: str, page_no: int, layout: str) -> dict:
     packet = io.BytesIO()
     width, height = float(source_page.mediabox.width), float(source_page.mediabox.height)
     overlay_canvas = canvas.Canvas(packet, pagesize=(width, height), pageCompression=1)
-    if selected_layout == "horizontal":
-        draw_horizontal_text(overlay_canvas, text, width, height)
-    else:
-        draw_vertical_text(overlay_canvas, text, blocks, width, height, image.width, image.height)
-    draw_search_aliases(overlay_canvas, text, blocks, image.size)
+    draw_word_style_authoritative_text(overlay_canvas, text, width, height, selected_layout)
     overlay_canvas.showPage()
     overlay_canvas.save()
     packet.seek(0)
     overlay = PdfReader(packet).pages[0]
     source_page.merge_page(overlay)
-    trial_pdf = paths.root / f"page-{page_no:04d}-trial.pdf"
     write_pdf_atomic(writer, trial_pdf)
 
     validation = validate_trial_output(pdf_path, page_no, trial_pdf, text, blocks, image.size)
@@ -3682,15 +5089,39 @@ def make_full_plan(job_id: str, layout: str) -> dict:
 
 def create_job(pdf_field, source_field=None, source_url: str = "", layout: str = "auto") -> dict:
     pdf_original = safe_name(getattr(pdf_field, "filename", "pdf"), "source.pdf")
-    job_id = make_job_id(pdf_original)
-    paths = job_paths(job_id)
+    source_original = ""
+    if source_field is not None and getattr(source_field, "filename", ""):
+        source_original = safe_name(source_field.filename, "source.txt")
+    elif source_url:
+        source_original = source_url.strip()
+    pdf_digest = upload_sha256(pdf_field)
+    source_identity = (
+        f"file:{upload_sha256(source_field)}"
+        if source_field is not None and source_original
+        else (f"url:{source_original}" if source_original else "none")
+    )
+    fingerprint = job_input_fingerprint(pdf_digest, source_identity, layout)
+    existing_job_id = reusable_job_id(
+        fingerprint, pdf_original, source_original, pdf_digest, source_identity, layout
+    )
+    if existing_job_id:
+        paths = job_paths(existing_job_id)
+        if not paths.pdf.exists():
+            write_upload(pdf_field, paths.pdf)
+        inspected = inspect_pdf(paths.pdf, layout)
+        inspected.update({"jobId": existing_job_id, "reused": True})
+        inspected["messages"].append("检测到 PDF、参考文本和版式均未变化，已恢复原任务和已有缓存。")
+        return inspected
+
+    job_id = hashlib.sha1(fingerprint.encode("ascii")).hexdigest()[:16]
+    if job_paths(job_id).root.exists():
+        job_id = make_job_id(pdf_original)
+    paths = new_job_paths(job_id, pdf_original)
     paths.root.mkdir(parents=True, exist_ok=True)
     write_upload(pdf_field, paths.pdf)
     source_text = ""
-    source_original = ""
     source_units: list[SourceUnit] = []
     if source_field is not None and getattr(source_field, "filename", ""):
-        source_original = safe_name(source_field.filename, "source.txt")
         source_upload = paths.root / source_original
         write_upload(source_field, source_upload)
         source_units = source_file_to_units(source_upload)
@@ -3701,6 +5132,7 @@ def create_job(pdf_field, source_field=None, source_url: str = "", layout: str =
         source_text = "\n\n".join(unit.text for unit in source_units if unit.text.strip())
     if source_text:
         atomic_write_text(paths.source, source_text)
+    source_quality = assess_source_units(source_units)
 
     inspected = inspect_pdf(paths.pdf, layout)
     meta = {
@@ -3711,14 +5143,23 @@ def create_job(pdf_field, source_field=None, source_url: str = "", layout: str =
         "sourceOriginal": source_original,
         "sourceArchive": str(source_upload) if source_field is not None and source_original else "",
         "layout": inspected["layout"],
+        "requestedLayout": layout,
+        "inputFingerprint": fingerprint,
+        "pdfSha256": pdf_digest,
+        "sourceIdentity": source_identity,
+        "sourceQuality": source_quality,
         "createdAt": time.time(),
     }
     atomic_write_json(paths.meta, meta)
     if source_units:
         save_source_units(meta, source_units)
     inspected["jobId"] = job_id
+    inspected["sourceQuality"] = source_quality
     if source_text:
         inspected["messages"].append(f"已读入参考文本，约 {len(source_text):,} 个字符。")
+        if source_url and source_quality["unitCount"] > 1:
+            inspected["messages"].append(f"网页已跟随读取 {source_quality['unitCount']} 个正文单元。")
+        inspected["messages"].extend(f"网页来源提醒：{warning}。" for warning in source_quality["warnings"])
     else:
         inspected["messages"].append("没有参考文本时，可以先试一页看看版面定位。")
     return inspected

@@ -1,5 +1,6 @@
 .cache/
 .vendor/
+.venv/
 tmp/
 __pycache__/
 *.py[cod]
@@ -12,4 +13,3 @@ __pycache__/
 desktop-pipeline.png
 mobile-pipeline.png
 activation-ui.png
-

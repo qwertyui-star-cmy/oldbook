@@ -3,11 +3,14 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+  <meta http-equiv="Pragma" content="no-cache">
+  <meta http-equiv="Expires" content="0">
   <title>文本精准定位古籍</title>
   <link rel="icon" href="assets/favicon.png?v=20260820-ui6" type="image/png">
   <link rel="shortcut icon" href="assets/app-icon.ico?v=20260820-ui6">
   <link rel="apple-touch-icon" href="assets/app-icon-192.png?v=20260820-ui6">
-  <link rel="stylesheet" href="styles.css?v=20260822-pipeline2">
+  <link rel="stylesheet" href="styles.css?v=20260824-folder-only1">
 </head>
 <body>
   <div class="app">
@@ -26,10 +29,24 @@
         </div>
       </section>
       <div class="top-actions">
+        <button class="history-button" id="jobLibraryHeaderButton" type="button" aria-expanded="false" aria-controls="jobLibraryPanel">历史任务</button>
         <button class="icon-button" type="button" data-action="theme" title="切换底色">◐</button>
         <a class="icon-button" href="README.md" title="说明">?</a>
       </div>
     </header>
+
+    <aside class="job-library" id="jobLibrary" aria-label="历史任务库">
+      <button class="job-library-tab" id="jobLibraryTab" type="button" aria-expanded="false" aria-controls="jobLibraryPanel">任务库</button>
+      <section class="job-library-panel" id="jobLibraryPanel">
+        <header>
+          <strong>书籍任务</strong>
+          <button class="job-library-refresh" id="refreshJobLibrary" type="button" title="刷新任务列表" aria-label="刷新任务列表">↻</button>
+        </header>
+        <div class="job-library-list" id="jobLibraryList">
+          <p>正在读取任务包…</p>
+        </div>
+      </section>
+    </aside>
 
     <main class="workspace">
       <section class="work-grid" aria-label="文字定位工作台">
@@ -49,7 +66,7 @@
             <div class="source-tabs" role="tablist" aria-label="文本来源">
               <button class="source-tab active" type="button" data-source="file">本地文本</button>
               <button class="source-tab" type="button" data-source="url">网页链接</button>
-              <button class="source-tab" type="button" data-source="none">先不放</button>
+              <button class="source-tab" type="button" data-source="none">只检查 PDF</button>
             </div>
 
             <label class="field source-field" data-source-field="file">
@@ -79,7 +96,9 @@
               </label>
             </div>
 
-            <button class="primary" type="submit">开始整理</button>
+            <button class="primary" id="importSubmit" type="submit">载入材料</button>
+            <div class="cache-result" id="cacheResult" hidden aria-live="polite"></div>
+            <section class="source-quality" id="sourceQuality" hidden aria-live="polite"></section>
           </form>
 
           <div id="summaryCards" class="summary-cards" hidden></div>
@@ -120,9 +139,20 @@
                 <button class="progress-pause" id="pauseProgress" type="button" disabled>暂停</button>
               </div>
             </div>
+            <div class="work-motion" id="workMotion" aria-hidden="true">
+              <div class="activity-particles">
+                <span></span><span></span><span></span><span></span><span></span>
+                <span></span><span></span><span></span><span></span>
+              </div>
+            </div>
             <progress id="progressBar" max="100" value="0"></progress>
             <p id="progressDetail">任务会在本地继续运行。</p>
-            <div class="pipeline-stages" id="pipelineStages" hidden></div>
+            <section class="diagnostics" id="diagnostics" hidden aria-live="polite"></section>
+            <button class="review-draft-button" id="reviewDraft" type="button" hidden>生成核对预览</button>
+            <details class="pipeline-details" id="pipelineDetails">
+              <summary>查看各阶段详情</summary>
+              <div class="pipeline-stages" id="pipelineStages" hidden></div>
+            </details>
           </div>
           <div id="outputs" class="outputs">
             <p>暂无输出。</p>
@@ -132,6 +162,6 @@
     </main>
   </div>
 
-  <script src="script.js?v=20260822-pipeline4"></script>
+  <script src="script.js?v=20260824-folder-only1"></script>
 </body>
 </html>
