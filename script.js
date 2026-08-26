@@ -247,7 +247,9 @@
         return `
           <article class="job-library-item ${job.jobId === currentJob ? "is-current" : ""}">
             <div class="job-library-item-head">
-              <strong title="${escapeHtml(job.bookName)}">${escapeHtml(job.bookName)}</strong>
+              <button class="job-library-book" type="button" data-job-action="folder" data-job-id="${escapeHtml(job.jobId)}" title="打开任务文件夹：${escapeHtml(job.bookName)}" aria-label="打开 ${escapeHtml(job.bookName)} 的任务文件夹">
+                <strong>${escapeHtml(job.bookName)}</strong>
+              </button>
               <span>${escapeHtml(jobStateLabel(job))}</span>
             </div>
             <div class="job-library-item-meta">
