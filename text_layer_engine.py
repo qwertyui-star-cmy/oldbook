@@ -94,7 +94,7 @@ TEXT_FONT = "HanText"
 TEXT_FONT_REGISTERED = False
 EXTB_TEXT_FONT = "HanTextExtB"
 EXTB_TEXT_FONT_REGISTERED = False
-LAYOUT_ENGINE_VERSION = "next-page-start-v18-mixed-output"
+LAYOUT_ENGINE_VERSION = "next-page-start-v19-positioned-ocr"
 ANCHOR_CACHE_VERSION = 11
 TEXT_FONT_CANDIDATES = [
     Path(r"C:\Windows\Fonts\STSONG.TTF"),
@@ -1681,6 +1681,74 @@ def draw_word_style_authoritative_text(
     return {"fontSize": round(font_size, 3), "columns": columns, "rows": rows}
 
 
+def draw_ocr_positioned_text(pdf_canvas, text: str, page_w: float, page_h: float, geometry: dict) -> dict:
+    """Place OCR text in its detected boxes without treating it as authoritative text."""
+    chars = canonical_output_text(text)
+    items = list(geometry.get("items") or [])
+    image_size = geometry.get("imageSize") or []
+    if not chars or len(image_size) != 2 or not items:
+        return {"placed": 0, "items": 0}
+    image_w, image_h = float(image_size[0] or 0), float(image_size[1] or 0)
+    if image_w <= 0 or image_h <= 0:
+        return {"placed": 0, "items": 0}
+    scale_x, scale_y = page_w / image_w, page_h / image_h
+    prepared = []
+    for item in items:
+        points = item.get("box") or []
+        if len(points) < 2:
+            continue
+        try:
+            xs = [float(point[0]) for point in points]
+            ys = [float(point[1]) for point in points]
+        except (TypeError, ValueError, IndexError):
+            continue
+        weight = len(canonical_output_text(str(item.get("text") or "")))
+        if weight:
+            prepared.append((item, min(xs), min(ys), max(xs), max(ys), weight))
+    total_weight = sum(item[5] for item in prepared)
+    if not total_weight:
+        return {"placed": 0, "items": 0}
+
+    pdf_canvas._code.append(f"/Span << /ActualText <{pdf_actual_text_hex(chars)}> >> BDC")
+    text_obj = pdf_canvas.beginText()
+    text_obj.setTextRenderMode(3)
+    current_font = ""
+    current_font_size = 0.0
+    placed = 0
+    consumed_weight = 0
+    for item_index, (_, x0, y0, x1, y1, weight) in enumerate(prepared):
+        start = round(consumed_weight * len(chars) / total_weight)
+        consumed_weight += weight
+        end = len(chars) if item_index == len(prepared) - 1 else round(consumed_weight * len(chars) / total_weight)
+        segment = chars[start:end]
+        if not segment:
+            continue
+        box_w = max(0.1, (x1 - x0) * scale_x)
+        box_h = max(0.1, (y1 - y0) * scale_y)
+        vertical = box_h > box_w * 1.15
+        advance = (box_h if vertical else box_w) / max(1, len(segment))
+        cross = box_w if vertical else box_h
+        font_size = max(0.5, min(advance * 0.92, cross * 0.88))
+        for char_index, char in enumerate(segment):
+            font = ensure_char_font(char)
+            if font != current_font or abs(font_size - current_font_size) > 0.001:
+                text_obj.setFont(font, font_size)
+                current_font = font
+                current_font_size = font_size
+            if vertical:
+                x = (x0 + x1) * 0.5 * scale_x - font_size * 0.5
+                y = page_h - (y0 * scale_y + (char_index + 0.88) * advance)
+            else:
+                x = x0 * scale_x + char_index * advance
+                y = page_h - y1 * scale_y + max(0.0, (box_h - font_size) * 0.5)
+            text_obj.setTextOrigin(x, y)
+            text_obj.textOut(char)
+            placed += 1
+    pdf_canvas.drawText(text_obj)
+    pdf_canvas._code.append("EMC")
+    return {"placed": placed, "items": len(prepared)}
+
+
 def expected_text_layer_norm(text: str) -> str:
     return canonical_output_text(text)
 
@@ -2006,7 +2074,7 @@ def original_slice(source_text: str, mapping: list[int], start_norm: int, end_no
     return source_text[start:end].strip()
 
 
-def sort_ocr_items(boxes, txts, scores, layout: str) -> list[str]:
+def ordered_ocr_items(boxes, txts, scores, layout: str) -> list[dict]:
     items = []
     boxes = [] if boxes is None else boxes
     txts = [] if txts is None else txts
@@ -2020,22 +2088,39 @@ def sort_ocr_items(boxes, txts, scores, layout: str) -> list[str]:
         ys = [point[1] for point in points]
         items.append({
             "text": text,
+            "box": points,
             "cx": sum(xs) / max(1, len(xs)),
             "cy": sum(ys) / max(1, len(ys)),
+            "score": float(score or 0),
         })
     if layout.startswith("vertical"):
         items.sort(key=lambda item: (-item["cx"], item["cy"]))
     else:
         items.sort(key=lambda item: (round(item["cy"] / 18), item["cx"]))
-    return [item["text"] for item in items]
+    return items
+
+
+def sort_ocr_items(boxes, txts, scores, layout: str) -> list[str]:
+    return [item["text"] for item in ordered_ocr_items(boxes, txts, scores, layout)]
+
+
+def ocr_image_payload(image: Image.Image, layout: str) -> dict:
+    engine = get_ocr_engine()
+    if engine is None:
+        return {"text": "", "items": [], "imageSize": list(image.size), "layout": layout}
+    result = engine(image)
+    items = ordered_ocr_items(result.boxes, result.txts, result.scores, layout)
+    text = clean_ocr_text("\n".join(item["text"] for item in items))
+    return {
+        "text": text,
+        "items": items,
+        "imageSize": list(image.size),
+        "layout": layout,
+    }
 
 
 def ocr_image_text(image: Image.Image, layout: str) -> str:
-    engine = get_ocr_engine()
-    if engine is None:
-        return ""
-    result = engine(image)
-    return clean_ocr_text("\n".join(sort_ocr_items(result.boxes, result.txts, result.scores, layout)))
+    return str(ocr_image_payload(image, layout).get("text") or "")
 
 
 def attach_ocr_column_geometry(job: dict, page_no: int, image: Image.Image, blocks: list[dict], page_text: str) -> list[dict]:
@@ -2745,15 +2830,17 @@ def ocr_page_text(job: dict, page_no: int, layout: str, anchors_only: bool = Tru
     cache_path = full_ocr_cache_path(job, page_no, layout)
     if cache_path.exists():
         text = cache_path.read_text(encoding="utf-8", errors="ignore")
-        if text.strip() or get_ocr_engine() is None:
+        if full_ocr_layout_path(job, page_no, layout).is_file() or get_ocr_engine() is None:
             cleaned = clean_ocr_text(text)
             if cleaned != text:
                 atomic_write_text(cache_path, cleaned)
             return cleaned
     image = render_page_image(Path(job["pdf"]), page_no, dpi=160)
-    text = ocr_image_text(image, layout)
+    payload = ocr_image_payload(image, layout)
+    text = str(payload.get("text") or "")
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     atomic_write_text(cache_path, text)
+    atomic_write_json(full_ocr_layout_path(job, page_no, layout), payload)
     return text
 
 
@@ -2763,16 +2850,41 @@ def full_ocr_cache_path(job: dict, page_no: int, layout: str) -> Path:
     return job_paths(job_id).root / cache_name if job_id else Path(job["pdf"]).parent / cache_name
 
 
+def full_ocr_layout_path(job: dict, page_no: int, layout: str) -> Path:
+    job_id = str(job.get("id") or "").strip()
+    cache_name = f"page-{page_no:04d}-ocr-layout-v2-{layout}.json"
+    return job_paths(job_id).root / cache_name if job_id else Path(job["pdf"]).parent / cache_name
+
+
+def full_ocr_cache_ready(job: dict, page_no: int, layout: str) -> bool:
+    return full_ocr_cache_path(job, page_no, layout).is_file() and full_ocr_layout_path(job, page_no, layout).is_file()
+
+
+def read_full_ocr_layout(job: dict, page_no: int, layout: str) -> dict | None:
+    path = full_ocr_layout_path(job, page_no, layout)
+    if not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(payload.get("items"), list) and len(payload.get("imageSize") or []) == 2:
+            return payload
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        pass
+    return None
+
+
 def full_page_ocr_worker(payload: tuple[str, int, str]) -> tuple[int, str, str]:
     job_id, page_no, layout = payload
     try:
         job = json.loads(job_paths(job_id).meta.read_text(encoding="utf-8"))
         cache_path = full_ocr_cache_path(job, page_no, layout)
-        if cache_path.exists():
+        if full_ocr_cache_ready(job, page_no, layout):
             return page_no, ocr_page_text(job, page_no, layout, anchors_only=False), ""
         image = render_page_images_persistent(Path(job["pdf"]), [page_no], dpi=160)[0]
-        text = ocr_image_text(image, layout)
+        ocr_payload = ocr_image_payload(image, layout)
+        text = str(ocr_payload.get("text") or "")
         atomic_write_text(cache_path, text)
+        atomic_write_json(full_ocr_layout_path(job, page_no, layout), ocr_payload)
         return page_no, text, ""
     except Exception as error:
         return page_no, "", str(error)
@@ -3733,8 +3845,7 @@ def fill_non_authoritative_ocr(
 
     pending_pages = []
     for page_no in sorted(by_page):
-        cache_path = full_ocr_cache_path(job, page_no, layout)
-        if cache_path.exists():
+        if full_ocr_cache_ready(job, page_no, layout):
             apply_text(page_no, ocr_page_text(job, page_no, layout, anchors_only=False))
             if status_job_id and read_full_status(status_job_id).get("pauseRequested"):
                 update_pipeline_stage(
@@ -4398,8 +4509,7 @@ def fill_source_omitted_ocr(
 
     pending_pages = []
     for page_no in sorted(by_page):
-        cache_path = full_ocr_cache_path(job, page_no, layout)
-        if cache_path.exists():
+        if full_ocr_cache_ready(job, page_no, layout):
             apply_text(page_no, ocr_page_text(job, page_no, layout, anchors_only=False))
             cached += 1
         else:
@@ -4427,7 +4537,7 @@ def fill_source_omitted_ocr(
             )
 
     if cached:
-        report(max(page for page in by_page if full_ocr_cache_path(job, page, layout).exists()), force=True)
+        report(max(page for page in by_page if full_ocr_cache_ready(job, page, layout)), force=True)
     if len(pending_pages) == 1:
         page_no = pending_pages[0]
         text = ocr_page_text(job, page_no, layout, anchors_only=False)
@@ -4469,11 +4579,16 @@ def page_text_for_full(reader: PdfReader, job: dict, page_no: int, segments: lis
     return text
 
 
-def overlay_for_page(page, text: str, blocks: list[dict], layout: str, image_size: tuple[int, int] | None) -> object:
+def overlay_for_page(
+    page, text: str, blocks: list[dict], layout: str,
+    image_size: tuple[int, int] | None, ocr_geometry: dict | None = None,
+) -> object:
     packet = io.BytesIO()
     width, height = float(page.mediabox.width), float(page.mediabox.height)
     overlay_canvas = canvas.Canvas(packet, pagesize=(width, height), pageCompression=1)
-    draw_word_style_authoritative_text(overlay_canvas, text, width, height, layout)
+    positioned = draw_ocr_positioned_text(overlay_canvas, text, width, height, ocr_geometry) if ocr_geometry else {"placed": 0}
+    if not positioned.get("placed"):
+        draw_word_style_authoritative_text(overlay_canvas, text, width, height, layout)
     overlay_canvas.showPage()
     overlay_canvas.save()
     packet.seek(0)
@@ -4830,13 +4945,15 @@ def validate_page_text_layer(pdf_path: Path, expected_text: str) -> int:
     return len(extracted_norm)
 
 
-def page_layer_signature(row: dict, layout: str) -> str:
+def page_layer_signature(row: dict, layout: str, ocr_geometry: dict | None = None) -> str:
+    is_ocr_layer = row.get("kind") == "ocr" or row.get("textOrigin") == "page-ocr"
     payload = {
         "engineVersion": LAYOUT_ENGINE_VERSION,
         "layout": layout,
         "page": int(row.get("page") or 0),
         "kind": str(row.get("kind") or ""),
         "text": str(row.get("text") or ""),
+        "ocrGeometry": ocr_geometry if is_ocr_layer else None,
     }
     return hashlib.sha256(
         json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
@@ -4856,13 +4973,16 @@ def page_layer_cache_valid(page_out: Path, signature_path: Path, signature: str,
 
 
 def write_page_layer(
+    job: dict,
     reader: PdfReader,
     page_no: int,
     row: dict,
     layout: str,
     page_out: Path,
 ) -> bool:
-    signature = page_layer_signature(row, layout)
+    is_ocr_layer = row.get("kind") == "ocr" or row.get("textOrigin") == "page-ocr"
+    ocr_geometry = read_full_ocr_layout(job, page_no, layout) if is_ocr_layer else None
+    signature = page_layer_signature(row, layout, ocr_geometry)
     signature_path = page_out.with_suffix(".sha256")
     text = str(row.get("text") or "")
     if page_layer_cache_valid(page_out, signature_path, signature, text):
@@ -4877,7 +4997,7 @@ def write_page_layer(
         height = float(page.mediabox.height)
         blocks, image_size = stable_vertical_blocks(width, height, layout)
     remove_text(page, writer)
-    overlay = overlay_for_page(page, text, blocks, layout, image_size)
+    overlay = overlay_for_page(page, text, blocks, layout, image_size, ocr_geometry=ocr_geometry)
     page.merge_page(overlay)
     write_pdf_atomic(writer, page_out)
     validate_page_text_layer(page_out, text)
@@ -4912,7 +5032,7 @@ def build_review_pdf(job_id: str, layout: str = "auto") -> dict:
         scan_marker = page_out.with_suffix(".scan-only")
         text = str(row.get("text") or "")
         if row.get("kind") != "unresolved" and text:
-            write_page_layer(reader, page_no, row, selected_layout, page_out)
+            write_page_layer(job, reader, page_no, row, selected_layout, page_out)
             scan_marker.unlink(missing_ok=True)
             confirmed += 1
         elif not page_out.exists() or not scan_marker.exists():
@@ -5090,7 +5210,7 @@ def build_full_pdf(job_id: str, layout: str, stop_after: int | None = None) -> d
 
     def commit_stream_page(page_no: int, row: dict) -> None:
         page_out = page_dir / f"page-{page_no:05d}.pdf"
-        write_page_layer(reader, page_no, row, selected_layout, page_out)
+        write_page_layer(job, reader, page_no, row, selected_layout, page_out)
         streamed_pages.add(page_no)
         verified_pages.add(page_no)
         if len(streamed_pages) == 1 or len(streamed_pages) % 10 == 0:
@@ -5268,7 +5388,7 @@ def build_full_pdf(job_id: str, layout: str, stop_after: int | None = None) -> d
     for page_no in range(1, page_count + 1):
         page_out = page_dir / f"page-{page_no:05d}.pdf"
         manifest_row = manifest[page_no - 1]
-        write_page_layer(reader, page_no, manifest_row, selected_layout, page_out)
+        write_page_layer(job, reader, page_no, manifest_row, selected_layout, page_out)
         verified_pages.add(page_no)
 
         if page_no == 1 or page_no % 10 == 0 or page_no == page_count:
@@ -5410,7 +5530,10 @@ def make_trial(job_id: str, page_no: int, layout: str) -> dict:
     packet = io.BytesIO()
     width, height = float(source_page.mediabox.width), float(source_page.mediabox.height)
     overlay_canvas = canvas.Canvas(packet, pagesize=(width, height), pageCompression=1)
-    draw_word_style_authoritative_text(overlay_canvas, text, width, height, selected_layout)
+    ocr_geometry = read_full_ocr_layout(job, page_no, selected_layout) if resolved.get("kind") == "ocr" else None
+    positioned = draw_ocr_positioned_text(overlay_canvas, text, width, height, ocr_geometry) if ocr_geometry else {"placed": 0}
+    if not positioned.get("placed"):
+        draw_word_style_authoritative_text(overlay_canvas, text, width, height, selected_layout)
     overlay_canvas.showPage()
     overlay_canvas.save()
     packet.seek(0)

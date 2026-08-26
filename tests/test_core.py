@@ -281,6 +281,40 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(engine.canonical_output_text(extracted), engine.canonical_output_text(expected))
         self.assertNotIn("为宣皇帝", extracted)
 
+    def test_pure_ocr_overlay_uses_detected_page_coordinates(self):
+        packet = io.BytesIO()
+        from reportlab.pdfgen import canvas
+
+        source_canvas = canvas.Canvas(packet, pagesize=(200, 300), pageCompression=1)
+        source_canvas.showPage()
+        source_canvas.save()
+        packet.seek(0)
+        page = PdfReader(packet, strict=False).pages[0]
+        expected = "侯。追尊宣王爲宣皇帝，禮樂制度皆如魏舊。"
+        geometry = {
+            "imageSize": [1000, 1500],
+            "items": [{
+                "text": expected,
+                "box": [[800, 200], [860, 200], [860, 1300], [800, 1300]],
+                "score": 0.99,
+            }],
+        }
+
+        overlay = engine.overlay_for_page(page, expected, [], "vertical-single", None, geometry)
+        extracted = overlay.extract_text() or ""
+        positions = []
+
+        def collect_position(text, _cm, text_matrix, _font, _size):
+            if text.strip():
+                positions.append(float(text_matrix[4]))
+
+        overlay.extract_text(visitor_text=collect_position)
+
+        self.assertEqual(engine.canonical_output_text(extracted), engine.canonical_output_text(expected))
+        self.assertTrue(positions)
+        self.assertGreater(min(positions), 150)
+        self.assertLess(max(positions), 175)
+
     def test_word_style_frame_reduces_font_instead_of_overflowing(self):
         usable_w = 595 - 2 * (3 * 72 / 2.54)
         usable_h = 842 - 2 * (3 * 72 / 2.54)
@@ -887,6 +921,7 @@ class EngineTests(unittest.TestCase):
 
             with (
                 patch.object(engine, "full_ocr_cache_path", return_value=cached),
+                patch.object(engine, "full_ocr_cache_ready", return_value=True),
                 patch.object(engine, "ocr_page_text", side_effect=["目录 OCR", ""]),
                 patch.object(engine, "classify_page", side_effect=classify),
             ):
