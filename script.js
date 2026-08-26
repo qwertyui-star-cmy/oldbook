@@ -204,7 +204,6 @@
     layoutMode.value = saved.layout || layoutMode.value;
     trialPage.value = saved.trialPage || trialPage.value || "1";
     sourceFields();
-    renderSourceQuality(data.sourceQuality);
   }
 
   function fileLabel(file) {
@@ -280,6 +279,7 @@
     if (data.sourceUrl) sourceUrl.value = data.sourceUrl;
     sourceFileLabel.textContent = data.sourceName ? `已恢复参考文本：${data.sourceName}` : "用于校准的文本";
     sourceFields();
+    renderSourceQuality(data.sourceQuality);
     renderCacheResult(data);
     if (data.pdfName) {
       pdfName.textContent = data.hasCachedPdf === false ? `${data.pdfName} · 源文件已清理` : `已恢复上次 PDF：${data.pdfName}`;
@@ -940,7 +940,13 @@
     { label: "页面样子", value: "--" }
   ]);
   const savedState = readSavedState();
-  applySavedControls(savedState);
+  try {
+    applySavedControls(savedState);
+  } catch (_) {
+    // A stale browser preference must never prevent the service check, task
+    // library, or latest-job restoration from starting.
+    sourceFields();
+  }
   checkEngine();
   const restorePath = "/api/restore/latest";
   if (restorePath) {
