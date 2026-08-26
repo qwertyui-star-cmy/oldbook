@@ -396,7 +396,6 @@ class EngineTests(unittest.TestCase):
                 "sourceText": "",
                 "sourceOriginal": "",
                 "layout": "horizontal",
-                "calibration": {"page": 1, "layout": "horizontal"},
             }
             engine.atomic_write_json(paths.meta, metadata)
             manifest = [
@@ -409,6 +408,7 @@ class EngineTests(unittest.TestCase):
             self.assertTrue((paths.root / "text-positioned-full.pdf").is_file())
             self.assertEqual(result["validation"]["pages"], 2)
             self.assertEqual(result["alignment"]["ocr"], 1)
+            self.assertNotIn("calibration", metadata)
 
     def test_epub_uses_spine_order_instead_of_filename_order(self):
         with tempfile.TemporaryDirectory() as temporary:

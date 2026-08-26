@@ -757,8 +757,9 @@
       preview.innerHTML = `
         <div class="empty-preview">
           <span class="seal large">停</span>
-          <strong>本页未通过严格双锁，没有生成 PDF</strong>
+          <strong>这一页不适合作为权威文字预览</strong>
           <p>${escapeHtml(error.message)}</p>
+          <p>生成整本时，这一页会自动改用整页 OCR；无需更换试页，也不会阻止整本任务。</p>
           ${suggestionButtons ? `<div class="trial-suggestions">${suggestionButtons}</div>` : ""}
         </div>
       `;
@@ -769,7 +770,7 @@
           runTrial.click();
         });
       });
-      outputState.textContent = "本页没有生成 PDF";
+      outputState.textContent = "试页未生成；仍可直接生成整本";
     } finally {
       runTrial.disabled = false;
       clearBusy();

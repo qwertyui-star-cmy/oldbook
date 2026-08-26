@@ -280,12 +280,13 @@ class AppHandler(SimpleHTTPRequestHandler):
                 int(item.get("page") or 0)
                 for item in (pages if isinstance(pages, list) else [])
                 if item.get("kind") == "body"
-                and item.get("status") in {"双头锁边", "全文 OCR 边界校准"}
+                and item.get("status") in {"页首与次页页首锁边", "双头锁边", "全文 OCR 边界校准"}
                 and int(item.get("page") or 0) != requested_page
             ]
             suggestions = sorted(candidates, key=lambda page: (abs(page - requested_page), page))
             job = json.loads(job_paths(job_id).meta.read_text(encoding="utf-8"))
-            verified_page = int((job.get("calibration") or {}).get("page") or 0)
+            previous_trial = job.get("lastTrial") or job.get("calibration") or {}
+            verified_page = int(previous_trial.get("page") or 0)
             if verified_page and verified_page != requested_page:
                 suggestions = [verified_page, *[page for page in suggestions if page != verified_page]]
             return suggestions[:limit]

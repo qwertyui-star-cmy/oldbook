@@ -1331,7 +1331,7 @@ def inspect_pdf(pdf_path: Path, requested_layout: str = "auto") -> dict:
     layout = requested_layout if requested_layout != "auto" else guess_layout(sizes)
     messages = []
     if ocr_score < 30:
-        messages.append("扫描页已就绪；试页时会自动识别页首、页尾并定位正文。")
+        messages.append("扫描页已就绪；可以直接生成整本，也可以先任选一页查看定位预览。")
     else:
         messages.append("PDF 已就绪；原有文字层不会直接沿用，将在生成时重新核对。")
 
@@ -5066,9 +5066,6 @@ def build_full_pdf(job_id: str, layout: str, stop_after: int | None = None) -> d
     stale_pdf = paths.root / ".text-positioned-full.stale.pdf"
     building_pdf = paths.root / ".text-positioned-full.building.pdf"
     manifest_path = paths.root / "page-text-manifest.json"
-    calibration = job.get("calibration") or {}
-    if not calibration:
-        raise ValueError("请先试一页并达到精准锁定，再生成整本。")
     if final_pdf.exists():
         stale_pdf.unlink(missing_ok=True)
         os.replace(final_pdf, stale_pdf)
@@ -5423,13 +5420,14 @@ def make_trial(job_id: str, page_no: int, layout: str) -> dict:
 
     validation = validate_trial_output(pdf_path, page_no, trial_pdf, text, blocks, image.size)
     if resolved.get("kind") == "body":
-        job["calibration"] = {
+        job["lastTrial"] = {
             "page": page_no,
             "layout": selected_layout,
             "sourceTitle": resolved.get("sourceTitle", ""),
             "sourceUrl": resolved.get("sourceUrl", ""),
             "confidence": resolved.get("confidence", 0),
             "validatedAt": time.time(),
+            "role": "preview-only",
         }
         atomic_write_json(paths.meta, job)
 
