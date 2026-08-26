@@ -941,6 +941,29 @@ class EngineTests(unittest.TestCase):
 
 
 class FileServerTests(unittest.TestCase):
+    def test_job_library_returns_completed_pdf_download_link(self):
+        with tempfile.TemporaryDirectory() as temporary, \
+                patch.object(engine, "JOBS_DIR", Path(temporary)), \
+                patch.object(server, "JOBS_DIR", Path(temporary)):
+            job_id = "aabbccddeeff0011"
+            paths = engine.new_job_paths(job_id, "晋书.pdf")
+            paths.root.mkdir(parents=True)
+            engine.atomic_write_json(paths.meta, {
+                "id": job_id,
+                "pdfOriginal": "晋书.pdf",
+                "pageCount": 2,
+            })
+            engine.write_full_status(job_id, state="done", processed=2, total=2, outputs=[])
+            (paths.root / "text-positioned-full.pdf").write_bytes(b"pdf")
+
+            handler = object.__new__(server.AppHandler)
+            jobs = handler.list_jobs()
+
+            self.assertEqual(len(jobs), 1)
+            self.assertTrue(jobs[0]["hasOutput"])
+            self.assertIn("/jobs/aabbccddeeff0011/text-positioned-full.pdf", jobs[0]["outputDownloadUrl"])
+            self.assertTrue(jobs[0]["outputDownloadUrl"].endswith("&download=1"))
+
     def test_job_diagnostics_summarizes_unresolved_runs(self):
         with tempfile.TemporaryDirectory() as temporary, patch.object(engine, "JOBS_DIR", Path(temporary)):
             job_id = "1122334455667788"

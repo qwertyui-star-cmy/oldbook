@@ -467,6 +467,8 @@ class AppHandler(SimpleHTTPRequestHandler):
                 with RUNNING_LOCK:
                     task = RUNNING_TASKS.get(job_id)
                     backend_active = bool(task and task.is_alive())
+                final_pdf = meta_path.parent / "text-positioned-full.pdf"
+                output_url = self.job_url(meta_path.parent, final_pdf) if final_pdf.is_file() else ""
                 jobs.append({
                     "jobId": job_id,
                     "bookName": Path(str(meta.get("pdfOriginal") or "未命名书籍")).stem,
@@ -476,7 +478,9 @@ class AppHandler(SimpleHTTPRequestHandler):
                     "processed": int(status.get("processed") or 0),
                     "total": int(status.get("total") or meta.get("pageCount") or 0),
                     "updatedAt": float(status.get("updatedAt") or meta_path.stat().st_mtime),
-                    "hasOutput": bool(status.get("outputs")),
+                    "hasOutput": bool(output_url),
+                    "outputUrl": output_url,
+                    "outputDownloadUrl": f"{output_url}&download=1" if output_url else "",
                 })
             except (OSError, ValueError, TypeError, json.JSONDecodeError):
                 continue
@@ -540,7 +544,15 @@ class AppHandler(SimpleHTTPRequestHandler):
         expected_review = int(alignment.get("reviewRequired") or alignment.get("unresolved") or 0)
         status["diagnostics"] = build_job_diagnostics(job_id, expected_review)
         public_outputs = []
-        for item in status.get("outputs", []):
+        stored_outputs = list(status.get("outputs") or [])
+        final_pdf = paths.root / "text-positioned-full.pdf"
+        if status.get("state") == "done" and final_pdf.is_file() and not stored_outputs:
+            stored_outputs = [{
+                "name": "整本文字定位 PDF",
+                "relative": "text-positioned-full.pdf",
+                "detail": "PDF",
+            }]
+        for item in stored_outputs:
             relative = item.get("relative")
             if relative:
                 output_path = paths.root / relative

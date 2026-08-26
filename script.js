@@ -32,6 +32,7 @@
   const preview = document.getElementById("preview");
   const outputs = document.getElementById("outputs");
   const outputState = document.getElementById("outputState");
+  const completionResult = document.getElementById("completionResult");
   const fullProgress = document.getElementById("fullProgress");
   const progressTitle = document.getElementById("progressTitle");
   const progressText = document.getElementById("progressText");
@@ -259,6 +260,7 @@
             <div class="job-library-item-actions">
               <button type="button" data-job-action="restore" data-job-id="${escapeHtml(job.jobId)}">进入任务</button>
               <button type="button" data-job-action="folder" data-job-id="${escapeHtml(job.jobId)}">打开文件夹</button>
+              ${job.outputDownloadUrl ? `<a class="job-result-link" href="${escapeHtml(job.outputDownloadUrl)}" download>下载成品</a>` : ""}
             </div>
           </article>
         `;
@@ -326,6 +328,23 @@
         <span>${escapeHtml(item.downloadUrl ? `下载 ${item.detail || "文件"}` : (item.detail || "打开"))}</span>
       </a>
     `).join("");
+  }
+
+  function renderCompletionResult(items, state) {
+    const pdf = Array.isArray(items) ? items.find(item => item.downloadUrl || item.url) : null;
+    if (state !== "done" || !pdf) {
+      completionResult.hidden = true;
+      completionResult.innerHTML = "";
+      return;
+    }
+    completionResult.hidden = false;
+    completionResult.innerHTML = `
+      <strong>整本 PDF 已经生成完成</strong>
+      <div>
+        <a class="completion-download" href="${escapeHtml(pdf.downloadUrl || pdf.url)}" download>下载整本 PDF</a>
+        <a class="completion-open" href="${escapeHtml(pdf.url || pdf.downloadUrl)}" target="_blank" rel="noreferrer">在线打开</a>
+      </div>
+    `;
   }
 
   function formatDuration(seconds) {
@@ -616,6 +635,7 @@
     if (payload.outputs) {
       renderOutputs(payload.outputs);
     }
+    renderCompletionResult(payload.outputs || [], payload.state);
     const canPause = ["running", "queued", "planning"].includes(payload.state) && !payload.pauseRequested;
     runTrial.disabled = backendActive || !currentJob;
     cleanupJob.disabled = backendActive || !currentJob;
