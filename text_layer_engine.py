@@ -2712,23 +2712,28 @@ def anchor_cache_ready(job_id: str, page_no: int, layout: str, input_fingerprint
         return False
 
 
-def adaptive_ocr_workers(requested: int | None = None) -> int:
+def ocr_worker_capacity(requested: int | None = None) -> int:
     logical_cpus = os.cpu_count() or 4
     # OCR engines are both CPU- and memory-heavy. Always leave at least two
     # logical CPUs for Windows, the browser, and the local web service.
     cpu_limit = max(1, min(4, logical_cpus - 2, max(1, logical_cpus // 3)))
-    automatic = cpu_limit
-    available_mb = available_memory_mb()
-    if available_mb:
-        # Reserve 2 GiB for the operating system and budget about 1.2 GiB for
-        # each OCR process. This deliberately prefers a slower healthy run to
-        # paging or terminating a large-book job.
-        memory_limit = max(1, min(4, int(max(0, available_mb - 2048) // 1200)))
-        automatic = min(automatic, memory_limit)
+    capacity = cpu_limit
     override = str(os.environ.get("TEXT_LAYER_OCR_WORKERS") or "").strip()
     if override.isdigit():
-        automatic = min(automatic, max(1, int(override)))
-    return max(1, min(automatic, requested)) if requested else max(1, automatic)
+        capacity = min(capacity, max(1, int(override)))
+    return max(1, min(capacity, requested)) if requested else max(1, capacity)
+
+
+def adaptive_ocr_workers(requested: int | None = None) -> int:
+    automatic = ocr_worker_capacity(requested)
+    available_mb = available_memory_mb()
+    if available_mb:
+        # Reserve 2 GiB for Windows and budget about 1.2 GiB per active OCR job.
+        # The executor keeps spare capacity, so later dispatches can expand when
+        # memory becomes available without restarting a long-running book.
+        memory_limit = max(1, min(4, int(max(0, available_mb - 2048) // 1200)))
+        automatic = min(automatic, memory_limit)
+    return max(1, automatic)
 
 
 def available_memory_mb() -> int:
@@ -2810,7 +2815,8 @@ def precompute_anchor_cache(
         contiguous_ready += 1
     if ready_callback and contiguous_ready >= first_page:
         ready_callback(contiguous_ready)
-    worker_count = adaptive_ocr_workers(workers)
+    worker_capacity = ocr_worker_capacity(workers)
+    worker_count = adaptive_ocr_workers(worker_capacity)
     reusable_starts = sum(
         (job_paths(job_id).root / f"page-{page_no:04d}-ocr-anchors-v8.json").exists()
         for page_no in pages
@@ -2825,7 +2831,7 @@ def precompute_anchor_cache(
         detail=f"{worker_count} 路并行，{'PDFium 常驻打开' if pdfium is not None else 'Poppler 分块渲染'}，复用旧页首 {reusable_starts} 页",
         metrics=throughput_metrics(
             work_started, newly_ocr, len(pages), workers=worker_count,
-            currentWorkers=worker_count, maxWorkers=worker_count,
+            currentWorkers=worker_count, maxWorkers=worker_capacity,
             cachedPages=cached, newlyOcrPages=newly_ocr, renderDpi="150→180 按需复核",
         ),
         message=(
@@ -2841,7 +2847,7 @@ def precompute_anchor_cache(
             page_batches[-1].append(page_no)
         else:
             page_batches.append([page_no])
-    with concurrent.futures.ProcessPoolExecutor(max_workers=worker_count) as pool:
+    with concurrent.futures.ProcessPoolExecutor(max_workers=worker_capacity) as pool:
         page_queue = iter(page_batches)
         future_pages = {}
         pending = set()
@@ -2859,7 +2865,7 @@ def precompute_anchor_cache(
             # Re-evaluate memory before dispatching more pages. Existing work is
             # allowed to finish, while new work is throttled when RAM becomes
             # scarce during a long book.
-            current_worker_limit = adaptive_ocr_workers(worker_count)
+            current_worker_limit = adaptive_ocr_workers(worker_capacity)
             while len(pending) < current_worker_limit:
                 try:
                     batch = next(page_queue)
@@ -2868,6 +2874,19 @@ def precompute_anchor_cache(
                 future = pool.submit(precompute_anchor_worker, (job_id, tuple(batch), layout))
                 future_pages[future] = tuple(batch)
                 pending.add(future)
+            active_pages = pending_page_numbers()
+            active_workers = len(pending)
+            update_pipeline_stage(
+                job_id, "ocr", "running", state="planning",
+                processed=completed, total=page_count,
+                detail=f"{active_workers} 路并行，正在处理第 {', '.join(map(str, active_pages[:4]))} 页",
+                metrics=throughput_metrics(
+                    work_started, newly_ocr, len(pages), workers=active_workers,
+                    currentWorkers=active_workers, maxWorkers=worker_capacity,
+                    activePages=active_pages, cachedPages=cached,
+                    newlyOcrPages=newly_ocr, renderDpi="150→180 按需复核",
+                ),
+            )
 
         fill_worker_queue()
         update_pipeline_stage(
@@ -2876,7 +2895,7 @@ def precompute_anchor_cache(
             detail=f"{current_worker_limit} 路并行，正在处理第 {', '.join(map(str, pending_page_numbers()[:4]))} 页",
             metrics=throughput_metrics(
                 work_started, newly_ocr, len(pages), workers=worker_count,
-                currentWorkers=current_worker_limit, maxWorkers=worker_count,
+                currentWorkers=len(pending), maxWorkers=worker_capacity,
                 activePages=pending_page_numbers(), cachedPages=cached,
                 newlyOcrPages=newly_ocr, renderDpi="150→180 按需复核",
             ),
@@ -2921,7 +2940,7 @@ def precompute_anchor_cache(
                         detail=f"工作进程仍在计算第 {', '.join(map(str, waiting_pages[:4]))} 页",
                         metrics=throughput_metrics(
                             work_started, newly_ocr, len(pages), workers=worker_count,
-                            currentWorkers=current_worker_limit, maxWorkers=worker_count,
+                            currentWorkers=len(pending), maxWorkers=worker_capacity,
                             activePages=pending_page_numbers(),
                             cachedPages=cached, newlyOcrPages=newly_ocr,
                             idleSeconds=round(idle_seconds, 1), renderDpi="150→180 按需复核",
@@ -2992,7 +3011,7 @@ def precompute_anchor_cache(
                         detail=f"{worker_count} 路并行，当前完成第 {page_no} 页",
                         metrics=throughput_metrics(
                             work_started, newly_ocr, len(pages), workers=worker_count,
-                            currentWorkers=current_worker_limit, maxWorkers=worker_count,
+                            currentWorkers=len(pending), maxWorkers=worker_capacity,
                             activePages=pending_page_numbers(),
                             cachedPages=cached, newlyOcrPages=newly_ocr,
                             idleSeconds=0, renderDpi="150→180 按需复核",
@@ -3032,7 +3051,7 @@ def precompute_anchor_cache(
         detail=f"双锁边 OCR 已完成；缓存 {len(all_pages)} 页",
         metrics=throughput_metrics(
             work_started, newly_ocr, len(pages), workers=worker_count,
-            currentWorkers=current_worker_limit, maxWorkers=worker_count,
+            currentWorkers=0, maxWorkers=worker_capacity,
             cachedPages=cached, newlyOcrPages=newly_ocr, renderDpi="150→180 按需复核",
         ),
         message="双锁边 OCR 已完成，对齐器正在收口检查连续页与章节边界。",
@@ -4048,7 +4067,8 @@ def fill_non_authoritative_ocr(
     by_page = {int(item["page"]): item for item in candidates}
     completed = 0
     started = time.time()
-    worker_count = adaptive_ocr_workers(3)
+    worker_capacity = ocr_worker_capacity(3)
+    current_worker_limit = adaptive_ocr_workers(worker_capacity)
 
     def apply_text(page_no: int, text: str) -> None:
         nonlocal completed
@@ -4084,7 +4104,10 @@ def fill_non_authoritative_ocr(
                 status_job_id, "classify", "running", state="planning",
                 processed=completed, total=len(candidates), currentPage=page_no,
                 detail=f"非权威页整页 OCR {completed} / {len(candidates)}",
-                metrics=throughput_metrics(started, completed, len(candidates), workers=worker_count),
+                metrics=throughput_metrics(
+                    started, completed, len(candidates), workers=current_worker_limit,
+                    currentWorkers=current_worker_limit, maxWorkers=worker_capacity,
+                ),
                 message=f"权威页已经固定，正在处理纯 OCR 页 {completed} / {len(candidates)}。",
             )
 
@@ -4106,18 +4129,32 @@ def fill_non_authoritative_ocr(
         page_no = pending_pages[0]
         apply_text(page_no, ocr_page_text(job, page_no, layout, anchors_only=False))
     elif pending_pages:
-        with concurrent.futures.ProcessPoolExecutor(max_workers=worker_count) as pool:
+        with concurrent.futures.ProcessPoolExecutor(max_workers=worker_capacity) as pool:
             page_queue = iter(pending_pages)
             pending: dict[concurrent.futures.Future, int] = {}
 
             def fill_queue() -> None:
-                current_limit = adaptive_ocr_workers(worker_count)
-                while len(pending) < current_limit:
+                nonlocal current_worker_limit
+                current_worker_limit = adaptive_ocr_workers(worker_capacity)
+                while len(pending) < current_worker_limit:
                     try:
                         page_no = next(page_queue)
                     except StopIteration:
                         break
                     pending[pool.submit(full_page_ocr_worker, (str(job.get("id") or ""), page_no, layout))] = page_no
+                if status_job_id:
+                    active_pages = sorted(pending.values())
+                    active_workers = len(pending)
+                    update_pipeline_stage(
+                        status_job_id, "classify", "running", state="planning",
+                        processed=completed, total=len(candidates),
+                        detail=f"非权威页整页 OCR {completed} / {len(candidates)}",
+                        metrics=throughput_metrics(
+                            started, completed, len(candidates), workers=active_workers,
+                            currentWorkers=active_workers, maxWorkers=worker_capacity,
+                            activePages=active_pages,
+                        ),
+                    )
 
             fill_queue()
             while pending:
@@ -4760,7 +4797,8 @@ def fill_source_omitted_ocr(
         else:
             pending_pages.append(page_no)
 
-    worker_count = adaptive_ocr_workers(3)
+    worker_capacity = ocr_worker_capacity(3)
+    current_worker_limit = adaptive_ocr_workers(worker_capacity)
 
     def report(page_no: int, force: bool = False) -> None:
         if status_job_id and (force or finished == 1 or finished % 5 == 0 or finished == len(by_page)):
@@ -4772,10 +4810,12 @@ def fill_source_omitted_ocr(
                 processed=finished,
                 total=len(by_page),
                 currentPage=page_no,
-                detail=f"来源未收录页 OCR {finished} / {len(by_page)}（{worker_count} 路）",
+                detail=f"来源未收录页 OCR {finished} / {len(by_page)}（{current_worker_limit} 路）",
                 metrics=throughput_metrics(
                     work_started, max(0, finished - cached), max(1, len(pending_pages)),
-                    workers=worker_count, cachedPages=cached, newlyOcrPages=max(0, finished - cached),
+                    workers=current_worker_limit, currentWorkers=current_worker_limit,
+                    maxWorkers=worker_capacity, cachedPages=cached,
+                    newlyOcrPages=max(0, finished - cached),
                     renderDpi=160,
                 ),
                 message=f"正在为已确认来源未收录的页面写入本页 OCR：{finished} / {len(by_page)}。",
@@ -4789,28 +4829,61 @@ def fill_source_omitted_ocr(
         apply_text(page_no, text)
         report(page_no, force=True)
     elif pending_pages:
-        with concurrent.futures.ProcessPoolExecutor(max_workers=worker_count) as pool:
-            futures = {
-                pool.submit(full_page_ocr_worker, (str(job.get("id") or ""), page_no, layout)): page_no
-                for page_no in pending_pages
-            }
-            for future in concurrent.futures.as_completed(futures):
-                page_no, text, error = future.result()
-                if error:
-                    for pending in futures:
-                        pending.cancel()
-                    raise RuntimeError(f"第 {page_no} 页整页 OCR 失败：{error}")
-                apply_text(page_no, text)
-                report(page_no)
+        with concurrent.futures.ProcessPoolExecutor(max_workers=worker_capacity) as pool:
+            page_queue = iter(pending_pages)
+            pending: dict[concurrent.futures.Future, int] = {}
+
+            def fill_queue() -> None:
+                nonlocal current_worker_limit
+                current_worker_limit = adaptive_ocr_workers(worker_capacity)
+                while len(pending) < current_worker_limit:
+                    try:
+                        page_no = next(page_queue)
+                    except StopIteration:
+                        break
+                    pending[pool.submit(
+                        full_page_ocr_worker, (str(job.get("id") or ""), page_no, layout)
+                    )] = page_no
+                if status_job_id:
+                    active_pages = sorted(pending.values())
+                    active_workers = len(pending)
+                    update_pipeline_stage(
+                        status_job_id, "classify", "running", state="planning",
+                        processed=finished, total=len(by_page),
+                        detail=f"来源未收录页 OCR {finished} / {len(by_page)}（{active_workers} 路）",
+                        metrics=throughput_metrics(
+                            work_started, max(0, finished - cached), max(1, len(pending_pages)),
+                            workers=active_workers, currentWorkers=active_workers,
+                            maxWorkers=worker_capacity, activePages=active_pages,
+                            cachedPages=cached, newlyOcrPages=max(0, finished - cached),
+                            renderDpi=160,
+                        ),
+                    )
+
+            fill_queue()
+            while pending:
+                done, _ = concurrent.futures.wait(
+                    tuple(pending), return_when=concurrent.futures.FIRST_COMPLETED
+                )
+                for future in done:
+                    expected_page = pending.pop(future)
+                    page_no, text, error = future.result()
+                    if error:
+                        for pending_future in pending:
+                            pending_future.cancel()
+                        raise RuntimeError(f"第 {expected_page} 页整页 OCR 失败：{error}")
+                    apply_text(page_no, text)
+                    report(page_no)
                 if status_job_id and read_full_status(status_job_id).get("pauseRequested"):
-                    for pending in futures:
-                        pending.cancel()
+                    for pending_future in pending:
+                        pending_future.cancel()
                     update_pipeline_stage(
                         status_job_id, "classify", "paused", state="paused",
                         processed=finished, total=len(by_page), detail="已完成结果和 OCR 缓存均已保留",
                         pauseRequested=False,
                     )
                     raise TaskPaused()
+                fill_queue()
     return completed
 
 

@@ -97,6 +97,15 @@ class EngineTests(unittest.TestCase):
         ):
             self.assertEqual(engine.adaptive_ocr_workers(), 1)
 
+    def test_ocr_pool_keeps_capacity_when_current_memory_allows_one_worker(self):
+        with (
+            patch.object(engine.os, "cpu_count", return_value=16),
+            patch.object(engine, "available_memory_mb", return_value=4000),
+            patch.dict("os.environ", {}, clear=True),
+        ):
+            self.assertEqual(engine.ocr_worker_capacity(), 4)
+            self.assertEqual(engine.adaptive_ocr_workers(), 1)
+
     def test_grouped_ocr_uses_grid_without_mixing_crop_coordinates(self):
         seen_sizes = []
 
