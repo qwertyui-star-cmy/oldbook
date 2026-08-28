@@ -82,7 +82,7 @@
     const progress = Number(active.total || 0)
       ? `${Number(active.processed || 0)} / ${Number(active.total)} 页`
       : "";
-    const workerText = workers > 0 ? `${workers} 路并行` : "";
+    const workerText = runningWorkers > 0 ? `${runningWorkers} 路并行` : "";
     const pageText = activePages.length ? `处理第 ${activePages.join("、")} 页` : "";
     if (workerIndicator) {
       workerIndicator.querySelectorAll("i").forEach((light, index) => {
@@ -306,6 +306,8 @@
   function renderInspection(data) {
     stopPolling();
     currentJob = data.jobId;
+    app.classList.add("has-job");
+    app.classList.toggle("has-preview", Boolean(data.previewUrl));
     jobBadge.textContent = `任务 ${data.jobId.slice(0, 8)}`;
     trialPage.max = data.pageCount || "";
     if (data.trialPage) trialPage.value = data.trialPage;
@@ -318,6 +320,7 @@
     renderCacheResult(data);
     if (data.pdfName) {
       pdfName.textContent = data.hasCachedPdf === false ? `${data.pdfName} · 源文件已清理` : `已恢复上次 PDF：${data.pdfName}`;
+      pdfName.title = data.pdfName;
     }
     renderCards([
       { label: "页数", value: data.pageCount || "--" },
@@ -722,6 +725,7 @@
 
   pdfFile.addEventListener("change", () => {
     pdfName.textContent = fileLabel(pdfFile.files[0]);
+    pdfName.title = pdfFile.files[0]?.name || "";
     if (pdfFile.files[0]) {
       rememberState({ pdfName: pdfFile.files[0].name });
     }
@@ -801,6 +805,7 @@
         })
       });
       preview.innerHTML = `<img src="${escapeHtml(payload.previewUrl)}" alt="定位线预览">`;
+      app.classList.add("has-preview");
       outputState.textContent = payload.trialStatus || "试页已生成";
       renderOutputs(payload.outputs || []);
       messages.hidden = false;

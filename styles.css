@@ -51,7 +51,8 @@ button, input, select { font: inherit; }
 .app {
   display: grid;
   grid-template-rows: auto minmax(0, 1fr);
-  min-height: 100vh;
+  height: 100vh;
+  min-height: 0;
   background: var(--paper);
 }
 
@@ -60,8 +61,8 @@ button, input, select { font: inherit; }
   grid-template-columns: minmax(260px, 1fr) minmax(220px, auto) auto;
   gap: 14px;
   align-items: center;
-  min-height: 72px;
-  padding: 12px clamp(18px, 3vw, 34px);
+  min-height: 62px;
+  padding: 8px clamp(16px, 2vw, 26px);
   border-bottom: 1px solid rgba(47, 144, 185, .18);
   border-radius: 0 0 0 40px;
   background:
@@ -80,10 +81,10 @@ button, input, select { font: inherit; }
 }
 
 .app-icon {
-  width: 42px !important;
-  height: 42px !important;
-  max-width: 42px;
-  max-height: 42px;
+  width: 36px !important;
+  height: 36px !important;
+  max-width: 36px;
+  max-height: 36px;
   flex: 0 0 auto;
   object-fit: contain;
 }
@@ -134,7 +135,7 @@ button, input, select { font: inherit; }
   align-items: center;
   min-width: 220px;
   max-width: 360px;
-  padding: 10px 14px;
+  padding: 6px 12px;
   border: 1px solid rgba(255, 255, 255, .22);
   border-radius: 999px;
   background: rgba(255, 255, 255, .1);
@@ -175,8 +176,8 @@ button, input, select { font: inherit; }
 .icon-button {
   display: grid;
   place-items: center;
-  width: 42px;
-  height: 42px;
+  width: 36px;
+  height: 36px;
   border: 1px solid rgba(47, 144, 185, .32);
   border-radius: 50%;
   background: rgba(255, 255, 255, .82);
@@ -382,18 +383,18 @@ button, input, select { font: inherit; }
 
 .work-grid {
   display: grid;
-  grid-template-columns: minmax(320px, 390px) minmax(520px, 1fr);
+  grid-template-columns: minmax(310px, 360px) minmax(520px, 1fr);
   grid-template-rows: minmax(0, 1fr) auto;
-  gap: 14px;
-  height: calc(100vh - 93px);
-  min-height: 620px;
-  padding: 14px clamp(18px, 3vw, 34px);
+  gap: 10px;
+  height: 100%;
+  min-height: 0;
+  padding: 10px clamp(14px, 2vw, 26px);
 }
 
 .panel {
   min-width: 0;
   border: 1px solid rgba(47, 144, 185, .22);
-  border-radius: 18px;
+  border-radius: 8px;
   background: var(--panel);
   box-shadow: 0 14px 32px rgba(20, 90, 118, .08);
   overflow: hidden;
@@ -406,6 +407,15 @@ button, input, select { font: inherit; }
   overflow-y: auto;
 }
 
+.output-panel {
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.app.has-job:not(.has-preview) .preview-panel { display: none; }
+.app.has-job:not(.has-preview) .output-panel { grid-row: 1 / span 2; }
+.app.has-preview .work-grid { grid-template-rows: minmax(210px, .7fr) minmax(320px, 1.3fr); }
+
 .preview-panel {
   display: flex;
   min-height: 0;
@@ -417,8 +427,8 @@ button, input, select { font: inherit; }
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  min-height: 48px;
-  padding: 11px 14px;
+  min-height: 40px;
+  padding: 8px 12px;
   border-bottom: 1px solid rgba(47, 144, 185, .18);
   background: rgba(239, 248, 250, .75);
 }
@@ -436,17 +446,17 @@ button, input, select { font: inherit; }
 
 .import-form {
   display: grid;
-  gap: 12px;
-  padding: 14px;
+  gap: 9px;
+  padding: 10px 12px;
 }
 
 .drop-zone {
   display: grid;
   place-items: center;
-  min-height: 120px;
-  padding: 16px;
+  min-height: 94px;
+  padding: 11px;
   border: 1px dashed rgba(47, 144, 185, .8);
-  border-radius: 30px 14px 30px 14px;
+  border-radius: 8px;
   background:
     repeating-linear-gradient(90deg, rgba(47, 144, 185, .06) 0 1px, transparent 1px 16px),
     rgba(255, 255, 255, .72);
@@ -469,9 +479,9 @@ button, input, select { font: inherit; }
 
 .drop-zone strong {
   display: block;
-  margin-bottom: 10px;
+  margin-bottom: 5px;
   color: var(--cloud-deep);
-  font-size: 19px;
+  font-size: 17px;
 }
 
 .drop-zone span {
@@ -493,7 +503,7 @@ button, input, select { font: inherit; }
 }
 
 .source-tab {
-  min-height: 42px;
+  min-height: 36px;
   border: 0;
   border-right: 1px solid rgba(47, 144, 185, .2);
   background: transparent;
@@ -511,7 +521,7 @@ button, input, select { font: inherit; }
 
 .field {
   display: grid;
-  gap: 8px;
+  gap: 5px;
 }
 
 .field span {
@@ -523,7 +533,7 @@ button, input, select { font: inherit; }
 .field input,
 .field select {
   min-width: 0;
-  min-height: 42px;
+  min-height: 36px;
   border: 1px solid rgba(47, 144, 185, .26);
   border-radius: 999px;
   background: #fff;
@@ -548,7 +558,7 @@ button, input, select { font: inherit; }
 .primary,
 .secondary,
 .mini-button {
-  min-height: 44px;
+  min-height: 38px;
   border: 1px solid transparent;
   border-radius: 999px;
   background: var(--vine);
@@ -678,14 +688,14 @@ button, input, select { font: inherit; }
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 8px;
-  padding: 0 14px 10px;
+  padding: 0 12px 8px;
 }
 
 .summary-cards article {
-  min-height: 62px;
-  padding: 9px;
+  min-height: 54px;
+  padding: 7px;
   border: 1px solid rgba(47, 144, 185, .22);
-  border-radius: 22px 10px 22px 10px;
+  border-radius: 6px;
   background: linear-gradient(180deg, #fff, var(--paper-blue));
 }
 
@@ -698,28 +708,30 @@ button, input, select { font: inherit; }
 }
 
 .summary-cards span {
-  margin-top: 8px;
+  margin-top: 4px;
   color: var(--cloud-deep);
-  font-size: 18px;
+  font-size: 16px;
   font-weight: 900;
   overflow-wrap: anywhere;
 }
 
 .messages {
-  margin: 0 14px 10px;
-  padding: 12px;
+  max-height: 92px;
+  margin: 0 12px 8px;
+  padding: 8px 10px;
   border: 1px solid rgba(47, 144, 185, .22);
-  border-radius: 22px 10px 22px 10px;
+  border-radius: 6px;
   background: #fff;
   color: var(--muted);
-  line-height: 1.7;
+  line-height: 1.45;
+  overflow-y: auto;
 }
 
 .run-actions {
   display: grid;
   grid-template-columns: 1fr 1fr auto;
-  gap: 10px;
-  padding: 0 14px 14px;
+  gap: 8px;
+  padding: 0 12px 10px;
 }
 
 .summary-cards[hidden],
@@ -768,7 +780,7 @@ button, input, select { font: inherit; }
 .outputs {
   display: grid;
   gap: 10px;
-  padding: 10px 14px 14px;
+  padding: 8px 10px 10px;
 }
 
 .completion-result {
@@ -814,11 +826,11 @@ button, input, select { font: inherit; }
 
 .progress-wrap {
   display: grid;
-  gap: 9px;
-  margin: 12px 14px 0;
-  padding: 12px;
+  gap: 7px;
+  margin: 8px 10px 0;
+  padding: 9px 10px;
   border: 1px solid rgba(47, 144, 185, .22);
-  border-radius: 24px 12px 24px 12px;
+  border-radius: 7px;
   background:
     linear-gradient(90deg, rgba(47, 144, 185, .08), rgba(254, 209, 16, .16)),
     #fff;
@@ -1367,6 +1379,39 @@ body.is-busy .secondary {
   .output-panel { grid-column: auto; }
   .import-panel { grid-row: auto; }
   .preview { height: 56vh; }
+}
+
+@media (min-width: 981px) and (max-height: 850px) {
+  .app-header {
+    min-height: 54px;
+    padding-top: 5px;
+    padding-bottom: 5px;
+  }
+
+  .brand h1 { font-size: 18px; }
+  .status-panel p { display: none; }
+  .work-grid { padding-top: 6px; padding-bottom: 6px; }
+  .panel-head { min-height: 34px; padding-top: 5px; padding-bottom: 5px; }
+  .app.has-job .import-form { gap: 5px; padding-top: 7px; padding-bottom: 7px; }
+  .app.has-job .drop-zone { min-height: 70px; padding: 7px 9px; }
+  .app.has-job .drop-zone strong { margin-bottom: 2px; font-size: 16px; }
+  .app.has-job .drop-zone span {
+    display: -webkit-box;
+    overflow: hidden;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+  }
+  .app.has-job .source-tab { min-height: 32px; }
+  .app.has-job .field { gap: 3px; }
+  .app.has-job .field input,
+  .app.has-job .field select { min-height: 32px; padding-top: 5px; padding-bottom: 5px; }
+  .app.has-job .primary { min-height: 34px; }
+  .app.has-job .cache-result { min-height: 40px; padding: 6px 8px; }
+  .app.has-job .source-quality { gap: 3px; padding: 6px 8px; }
+  .app.has-job .summary-cards article { min-height: 48px; padding: 5px 6px; }
+  .app.has-job .messages { max-height: 54px; padding: 6px 8px; }
+  .app.has-job .run-actions { padding-bottom: 7px; }
+  .app.has-job .secondary { min-height: 34px; }
 }
 
 @media (max-width: 620px) {
