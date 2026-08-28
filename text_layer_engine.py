@@ -2847,6 +2847,13 @@ def precompute_anchor_cache(
         pending = set()
         current_worker_limit = worker_count
 
+        def pending_page_numbers() -> list[int]:
+            return sorted(
+                page_no
+                for future in pending
+                for page_no in future_pages.get(future, ())
+            )
+
         def fill_worker_queue() -> None:
             nonlocal current_worker_limit
             # Re-evaluate memory before dispatching more pages. Existing work is
@@ -2863,6 +2870,17 @@ def precompute_anchor_cache(
                 pending.add(future)
 
         fill_worker_queue()
+        update_pipeline_stage(
+            job_id, "ocr", "running", state="planning",
+            processed=completed, total=page_count,
+            detail=f"{current_worker_limit} 路并行，正在处理第 {', '.join(map(str, pending_page_numbers()[:4]))} 页",
+            metrics=throughput_metrics(
+                work_started, newly_ocr, len(pages), workers=worker_count,
+                currentWorkers=current_worker_limit, maxWorkers=worker_count,
+                activePages=pending_page_numbers(), cachedPages=cached,
+                newlyOcrPages=newly_ocr, renderDpi="150→180 按需复核",
+            ),
+        )
         last_progress = time.time()
         last_heartbeat = last_progress
         paused = False
@@ -2904,6 +2922,7 @@ def precompute_anchor_cache(
                         metrics=throughput_metrics(
                             work_started, newly_ocr, len(pages), workers=worker_count,
                             currentWorkers=current_worker_limit, maxWorkers=worker_count,
+                            activePages=pending_page_numbers(),
                             cachedPages=cached, newlyOcrPages=newly_ocr,
                             idleSeconds=round(idle_seconds, 1), renderDpi="150→180 按需复核",
                         ),
@@ -2974,6 +2993,7 @@ def precompute_anchor_cache(
                         metrics=throughput_metrics(
                             work_started, newly_ocr, len(pages), workers=worker_count,
                             currentWorkers=current_worker_limit, maxWorkers=worker_count,
+                            activePages=pending_page_numbers(),
                             cachedPages=cached, newlyOcrPages=newly_ocr,
                             idleSeconds=0, renderDpi="150→180 按需复核",
                         ),

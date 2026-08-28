@@ -39,7 +39,13 @@
   const progressBar = document.getElementById("progressBar");
   const progressDetail = document.getElementById("progressDetail");
   const workMotion = document.getElementById("workMotion");
-  const parallelStatus = document.getElementById("parallelStatus");
+  const workerLanes = document.getElementById("workerLanes");
+  const ocrFlowStep = document.getElementById("ocrFlowStep");
+  const alignFlowStep = document.getElementById("alignFlowStep");
+  const layerFlowStep = document.getElementById("layerFlowStep");
+  const ocrFlowProgress = document.getElementById("ocrFlowProgress");
+  const alignFlowProgress = document.getElementById("alignFlowProgress");
+  const layerFlowProgress = document.getElementById("layerFlowProgress");
   const diagnostics = document.getElementById("diagnostics");
   const pipelineDetails = document.getElementById("pipelineDetails");
   const pipelineStages = document.getElementById("pipelineStages");
@@ -65,6 +71,43 @@
       "\"": "&quot;",
       "'": "&#039;"
     }[char]));
+  }
+
+  function renderExecutionFlow(pipeline, backendActive) {
+    const stages = Array.isArray(pipeline) ? pipeline : [];
+    const stageById = id => stages.find(stage => stage.id === id) || {};
+    const ocr = stageById("ocr");
+    const align = stageById("align");
+    const layer = stageById("layer");
+    const metrics = ocr.metrics || {};
+    const workers = Number(metrics.currentWorkers || metrics.workers || 0);
+    const maximum = Number(metrics.maxWorkers || metrics.workers || 0);
+    const activePages = Array.isArray(metrics.activePages) ? metrics.activePages.map(Number) : [];
+    const setStep = (element, stage) => {
+      if (!element) return;
+      element.classList.toggle("is-active", stage.state === "running");
+      element.classList.toggle("is-done", stage.state === "done");
+      element.classList.toggle("is-paused", stage.state === "paused");
+    };
+    setStep(ocrFlowStep, ocr);
+    setStep(alignFlowStep, align);
+    setStep(layerFlowStep, layer);
+    const formatProgress = stage => `${Number(stage.processed || 0)} / ${Number(stage.total || 0)}`;
+    if (ocrFlowProgress) ocrFlowProgress.textContent = formatProgress(ocr);
+    if (alignFlowProgress) alignFlowProgress.textContent = formatProgress(align);
+    if (layerFlowProgress) layerFlowProgress.textContent = formatProgress(layer);
+    if (workerLanes) {
+      workerLanes.innerHTML = workers > 0
+        ? Array.from({ length: workers }, (_, index) => {
+            const page = activePages[index];
+            const detail = Number.isFinite(page) && page > 0
+              ? `第 ${page} 页`
+              : (backendActive ? "运行中" : "已暂停");
+            return `<span><b>${index + 1}</b>${escapeHtml(detail)}</span>`;
+          }).join("")
+        : '<span class="is-idle">等待启动</span>';
+      workerLanes.setAttribute("aria-label", maximum > workers ? `当前 ${workers} 路，上限 ${maximum} 路` : `${workers} 路并行`);
+    }
   }
 
   function setBusy(label) {
@@ -563,14 +606,7 @@
         })
       : [];
     const activeMetrics = activeStage?.metrics || {};
-    const currentWorkers = Number(activeMetrics.currentWorkers || activeMetrics.workers || 0);
-    const maxWorkers = Number(activeMetrics.maxWorkers || activeMetrics.workers || 0);
-    if (parallelStatus) {
-      parallelStatus.hidden = currentWorkers <= 0;
-      parallelStatus.textContent = maxWorkers > currentWorkers
-        ? `并行 ${currentWorkers} 路（上限 ${maxWorkers} 路）`
-        : `并行 ${currentWorkers} 路`;
-    }
+    renderExecutionFlow(payload.pipeline, backendActive);
     const displayedTotal = Number(activeStage?.total || total);
     const displayedProcessed = Number(activeStage?.processed ?? processed);
     const percent = displayedTotal

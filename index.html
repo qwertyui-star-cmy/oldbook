@@ -141,11 +141,22 @@
               </div>
             </div>
             <div class="work-motion" id="workMotion">
-              <div class="activity-particles">
-                <span></span><span></span><span></span><span></span><span></span>
-                <span></span><span></span><span></span><span></span>
+              <div class="execution-flow" id="executionFlow">
+                <section class="execution-step" id="ocrFlowStep">
+                  <div class="execution-step-head"><strong>页边 OCR</strong><span id="ocrFlowProgress">0 / 0</span></div>
+                  <div class="worker-lanes" id="workerLanes"></div>
+                </section>
+                <span class="flow-arrow" aria-hidden="true">→</span>
+                <section class="execution-step" id="alignFlowStep">
+                  <div class="execution-step-head"><strong>顺序对齐</strong><span id="alignFlowProgress">0 / 0</span></div>
+                  <small>等待连续页</small>
+                </section>
+                <span class="flow-arrow" aria-hidden="true">→</span>
+                <section class="execution-step" id="layerFlowStep">
+                  <div class="execution-step-head"><strong>按序写入</strong><span id="layerFlowProgress">0 / 0</span></div>
+                  <small>等待页界确认</small>
+                </section>
               </div>
-              <strong class="parallel-status" id="parallelStatus" hidden>并行 -- 路</strong>
             </div>
             <progress id="progressBar" max="100" value="0"></progress>
             <p id="progressDetail">任务会在本地继续运行。</p>
@@ -165,6 +176,6 @@
     </main>
   </div>
 
-  <script src="script.js?v=20260828-parallel-status1"></script>
+  <script src="script.js?v=20260828-execution-flow1"></script>
 </body>
 </html>
