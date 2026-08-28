@@ -856,6 +856,34 @@ button, input, select { font: inherit; }
   font-size: 13px;
 }
 
+.worker-indicator {
+  display: inline-flex;
+  flex: 0 0 auto;
+  gap: 6px;
+  align-items: center;
+  min-height: 28px;
+  padding: 4px 8px;
+  border: 1px solid rgba(47, 144, 185, .22);
+  border-radius: 6px;
+  background: rgba(255, 255, 255, .72);
+}
+
+.worker-indicator i {
+  display: block;
+  width: 12px;
+  height: 12px;
+  border: 1px solid rgba(47, 144, 185, .28);
+  border-radius: 50%;
+  background: #d9eff8;
+  box-shadow: inset 0 1px 2px rgba(255, 255, 255, .9);
+}
+
+.worker-indicator i.is-active {
+  border-color: #167ca7;
+  background: #35a8d5;
+  box-shadow: 0 0 0 3px rgba(53, 168, 213, .16), inset 0 1px 1px rgba(255, 255, 255, .5);
+}
+
 .backend-activity strong,
 .backend-activity span {
   min-width: 0;

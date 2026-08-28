@@ -39,6 +39,7 @@
   const progressBar = document.getElementById("progressBar");
   const progressDetail = document.getElementById("progressDetail");
   const workMotion = document.getElementById("workMotion");
+  const workerIndicator = document.getElementById("workerIndicator");
   const backendActivityTitle = document.getElementById("backendActivityTitle");
   const backendActivityDetail = document.getElementById("backendActivityDetail");
   const diagnostics = document.getElementById("diagnostics");
@@ -76,12 +77,21 @@
     if (!active || !backendActivityTitle || !backendActivityDetail) return;
     const metrics = active.metrics || {};
     const workers = Number(metrics.currentWorkers || metrics.workers || 0);
+    const runningWorkers = backendActive ? workers : 0;
     const activePages = Array.isArray(metrics.activePages) ? metrics.activePages.map(Number).filter(Boolean) : [];
     const progress = Number(active.total || 0)
       ? `${Number(active.processed || 0)} / ${Number(active.total)} 页`
       : "";
     const workerText = workers > 0 ? `${workers} 路并行` : "";
     const pageText = activePages.length ? `处理第 ${activePages.join("、")} 页` : "";
+    if (workerIndicator) {
+      workerIndicator.querySelectorAll("i").forEach((light, index) => {
+        light.classList.toggle("is-active", index < runningWorkers);
+      });
+      const workerLabel = runningWorkers > 0 ? `OCR 当前 ${runningWorkers} 路并行` : "OCR 当前未运行";
+      workerIndicator.setAttribute("aria-label", workerLabel);
+      workerIndicator.title = workerLabel;
+    }
     backendActivityTitle.textContent = active.label || "后台任务";
     backendActivityDetail.textContent = [workerText, pageText, progress, backendActive ? "运行中" : "已暂停"]
       .filter(Boolean).join(" · ");
