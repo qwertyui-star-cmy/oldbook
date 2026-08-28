@@ -2825,6 +2825,7 @@ def precompute_anchor_cache(
         detail=f"{worker_count} 路并行，{'PDFium 常驻打开' if pdfium is not None else 'Poppler 分块渲染'}，复用旧页首 {reusable_starts} 页",
         metrics=throughput_metrics(
             work_started, newly_ocr, len(pages), workers=worker_count,
+            currentWorkers=worker_count, maxWorkers=worker_count,
             cachedPages=cached, newlyOcrPages=newly_ocr, renderDpi="150→180 按需复核",
         ),
         message=(
@@ -2844,13 +2845,15 @@ def precompute_anchor_cache(
         page_queue = iter(page_batches)
         future_pages = {}
         pending = set()
+        current_worker_limit = worker_count
 
         def fill_worker_queue() -> None:
+            nonlocal current_worker_limit
             # Re-evaluate memory before dispatching more pages. Existing work is
             # allowed to finish, while new work is throttled when RAM becomes
             # scarce during a long book.
-            current_limit = adaptive_ocr_workers(worker_count)
-            while len(pending) < current_limit:
+            current_worker_limit = adaptive_ocr_workers(worker_count)
+            while len(pending) < current_worker_limit:
                 try:
                     batch = next(page_queue)
                 except StopIteration:
@@ -2900,6 +2903,7 @@ def precompute_anchor_cache(
                         detail=f"工作进程仍在计算第 {', '.join(map(str, waiting_pages[:4]))} 页",
                         metrics=throughput_metrics(
                             work_started, newly_ocr, len(pages), workers=worker_count,
+                            currentWorkers=current_worker_limit, maxWorkers=worker_count,
                             cachedPages=cached, newlyOcrPages=newly_ocr,
                             idleSeconds=round(idle_seconds, 1), renderDpi="150→180 按需复核",
                         ),
@@ -2969,6 +2973,7 @@ def precompute_anchor_cache(
                         detail=f"{worker_count} 路并行，当前完成第 {page_no} 页",
                         metrics=throughput_metrics(
                             work_started, newly_ocr, len(pages), workers=worker_count,
+                            currentWorkers=current_worker_limit, maxWorkers=worker_count,
                             cachedPages=cached, newlyOcrPages=newly_ocr,
                             idleSeconds=0, renderDpi="150→180 按需复核",
                         ),
@@ -3007,6 +3012,7 @@ def precompute_anchor_cache(
         detail=f"双锁边 OCR 已完成；缓存 {len(all_pages)} 页",
         metrics=throughput_metrics(
             work_started, newly_ocr, len(pages), workers=worker_count,
+            currentWorkers=current_worker_limit, maxWorkers=worker_count,
             cachedPages=cached, newlyOcrPages=newly_ocr, renderDpi="150→180 按需复核",
         ),
         message="双锁边 OCR 已完成，对齐器正在收口检查连续页与章节边界。",

@@ -422,6 +422,11 @@
       const metrics = stage.metrics || {};
       const progressLabel = total ? `${processed} / ${total}` : "";
       const metricLabels = [
+        Number(metrics.currentWorkers || metrics.workers || 0) > 0
+          ? (Number(metrics.maxWorkers || metrics.workers || 0) > Number(metrics.currentWorkers || metrics.workers || 0)
+            ? `并行 ${Number(metrics.currentWorkers || metrics.workers)} 路（上限 ${Number(metrics.maxWorkers || metrics.workers)} 路）`
+            : `并行 ${Number(metrics.currentWorkers || metrics.workers)} 路`)
+          : "",
         Number(metrics.pagesPerMinute || 0) > 0 ? `${Number(metrics.pagesPerMinute).toFixed(1)} 页/分` : "",
         Number(metrics.etaSeconds || 0) > 0 ? `预计 ${formatDuration(Number(metrics.etaSeconds))}` : "",
         Number(metrics.cachedPages || 0) > 0 ? `缓存 ${Number(metrics.cachedPages)} 页` : "",
