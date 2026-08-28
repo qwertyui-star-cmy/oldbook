@@ -95,7 +95,9 @@ TEXT_FONT_REGISTERED = False
 EXTB_TEXT_FONT = "HanTextExtB"
 EXTB_TEXT_FONT_REGISTERED = False
 LAYOUT_ENGINE_VERSION = "next-page-start-v23-multistage-ancient-ocr"
-ANCHOR_CACHE_VERSION = 11
+ANCHOR_CACHE_VERSION = 12
+ANCHOR_BASE_DPI = 150
+ANCHOR_RETRY_DPI = 180
 FULL_OCR_BASE_DPI = 150
 FULL_OCR_RETRY_DPIS = (190, 230)
 MIN_COLUMN_OCR_WIDTH = 64
@@ -2567,7 +2569,7 @@ def ocr_page_anchor_pair(
     page_no: int,
     layout: str,
     rendered_image: Image.Image | None = None,
-    render_dpi: int = 140,
+    render_dpi: int = ANCHOR_BASE_DPI,
 ) -> tuple[str, str]:
     job_id = str(job.get("id") or "").strip()
     paths = job_paths(job_id) if job_id else None
@@ -2595,7 +2597,9 @@ def ocr_page_anchor_pair(
                 legacy_start = str(legacy_payload.get("start") or "")
             except (OSError, json.JSONDecodeError):
                 pass
-    image = rendered_image if rendered_image is not None else render_page_image(Path(job["pdf"]), page_no, dpi=140)
+    image = rendered_image if rendered_image is not None else render_page_image(
+        Path(job["pdf"]), page_no, dpi=ANCHOR_BASE_DPI
+    )
     detected_blocks = detect_horizontal_block(image) if layout == "horizontal" else detect_vertical_blocks(image, layout)
     edge_runs = None
     if layout != "horizontal" and detected_blocks:
@@ -2669,21 +2673,23 @@ def precompute_anchor_worker(payload: tuple[str, tuple[int, ...], str]) -> list[
     try:
         paths = job_paths(job_id)
         job = json.loads(paths.meta.read_text(encoding="utf-8"))
-        images = render_page_images_persistent(Path(job["pdf"]), list(page_numbers), dpi=120)
+        images = render_page_images_persistent(Path(job["pdf"]), list(page_numbers), dpi=ANCHOR_BASE_DPI)
     except Exception as error:
         return [(page_no, False, str(error)) for page_no in page_numbers]
     results = []
     for page_no, image in zip(page_numbers, images):
         try:
             start_text, end_text = ocr_page_anchor_pair(
-                job, page_no, layout, rendered_image=image, render_dpi=120
+                job, page_no, layout, rendered_image=image, render_dpi=ANCHOR_BASE_DPI
             )
             if not anchor_pair_strong_for_source(job, start_text, end_text):
                 cache_path = job_paths(job_id).root / f"page-{page_no:04d}-ocr-anchors-v{ANCHOR_CACHE_VERSION}.json"
                 cache_path.unlink(missing_ok=True)
-                high_image = render_page_images_persistent(Path(job["pdf"]), [page_no], dpi=140)[0]
+                high_image = render_page_images_persistent(
+                    Path(job["pdf"]), [page_no], dpi=ANCHOR_RETRY_DPI
+                )[0]
                 start_text, end_text = ocr_page_anchor_pair(
-                    job, page_no, layout, rendered_image=high_image, render_dpi=140
+                    job, page_no, layout, rendered_image=high_image, render_dpi=ANCHOR_RETRY_DPI
                 )
             results.append((page_no, bool(start_text or end_text), ""))
         except Exception as error:
@@ -2819,7 +2825,7 @@ def precompute_anchor_cache(
         detail=f"{worker_count} 路并行，{'PDFium 常驻打开' if pdfium is not None else 'Poppler 分块渲染'}，复用旧页首 {reusable_starts} 页",
         metrics=throughput_metrics(
             work_started, newly_ocr, len(pages), workers=worker_count,
-            cachedPages=cached, newlyOcrPages=newly_ocr, renderDpi="120→140 按需复核",
+            cachedPages=cached, newlyOcrPages=newly_ocr, renderDpi="150→180 按需复核",
         ),
         message=(
             f"正在复用旧页首、仅更新页尾 OCR {completed} / {len(all_pages)}（{worker_count} 路并行）。"
@@ -2895,7 +2901,7 @@ def precompute_anchor_cache(
                         metrics=throughput_metrics(
                             work_started, newly_ocr, len(pages), workers=worker_count,
                             cachedPages=cached, newlyOcrPages=newly_ocr,
-                            idleSeconds=round(idle_seconds, 1), renderDpi="120→140 按需复核",
+                            idleSeconds=round(idle_seconds, 1), renderDpi="150→180 按需复核",
                         ),
                         message="OCR 工作进程仍在计算，连续页进度将在页面完成后推进。",
                     )
@@ -2964,7 +2970,7 @@ def precompute_anchor_cache(
                         metrics=throughput_metrics(
                             work_started, newly_ocr, len(pages), workers=worker_count,
                             cachedPages=cached, newlyOcrPages=newly_ocr,
-                            idleSeconds=0, renderDpi="120→140 按需复核",
+                            idleSeconds=0, renderDpi="150→180 按需复核",
                         ),
                         message=f"正在逐页进行 OCR 双锁边 {completed} / {len(all_pages)}（{worker_count} 路并行）。",
                     )
@@ -3001,7 +3007,7 @@ def precompute_anchor_cache(
         detail=f"双锁边 OCR 已完成；缓存 {len(all_pages)} 页",
         metrics=throughput_metrics(
             work_started, newly_ocr, len(pages), workers=worker_count,
-            cachedPages=cached, newlyOcrPages=newly_ocr, renderDpi="120→140 按需复核",
+            cachedPages=cached, newlyOcrPages=newly_ocr, renderDpi="150→180 按需复核",
         ),
         message="双锁边 OCR 已完成，对齐器正在收口检查连续页与章节边界。",
     )

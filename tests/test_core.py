@@ -772,8 +772,14 @@ class EngineTests(unittest.TestCase):
                 result = engine.precompute_anchor_worker((job_id, (1,), "vertical-single"))
 
             self.assertEqual(result, [(1, True, "")])
-            self.assertEqual([call.kwargs["dpi"] for call in render.call_args_list], [120, 140])
-            self.assertEqual([call.kwargs["render_dpi"] for call in anchors.call_args_list], [120, 140])
+            self.assertEqual(
+                [call.kwargs["dpi"] for call in render.call_args_list],
+                [engine.ANCHOR_BASE_DPI, engine.ANCHOR_RETRY_DPI],
+            )
+            self.assertEqual(
+                [call.kwargs["render_dpi"] for call in anchors.call_args_list],
+                [engine.ANCHOR_BASE_DPI, engine.ANCHOR_RETRY_DPI],
+            )
 
     def test_multi_page_unresolved_run_recovers_only_with_internal_boundaries(self):
         unit = engine.SourceUnit(
