@@ -141,21 +141,9 @@
               </div>
             </div>
             <div class="work-motion" id="workMotion">
-              <div class="execution-flow" id="executionFlow">
-                <section class="execution-step" id="ocrFlowStep">
-                  <div class="execution-step-head"><strong>页边 OCR</strong><span id="ocrFlowProgress">0 / 0</span></div>
-                  <div class="worker-lanes" id="workerLanes"></div>
-                </section>
-                <span class="flow-arrow" aria-hidden="true">→</span>
-                <section class="execution-step" id="alignFlowStep">
-                  <div class="execution-step-head"><strong>顺序对齐</strong><span id="alignFlowProgress">0 / 0</span></div>
-                  <small>等待连续页</small>
-                </section>
-                <span class="flow-arrow" aria-hidden="true">→</span>
-                <section class="execution-step" id="layerFlowStep">
-                  <div class="execution-step-head"><strong>按序写入</strong><span id="layerFlowProgress">0 / 0</span></div>
-                  <small>等待页界确认</small>
-                </section>
+              <div class="backend-activity">
+                <strong id="backendActivityTitle">等待后台任务</strong>
+                <span id="backendActivityDetail"></span>
               </div>
             </div>
             <progress id="progressBar" max="100" value="0"></progress>
@@ -164,7 +152,7 @@
             <section class="diagnostics" id="diagnostics" hidden aria-live="polite"></section>
             <button class="review-draft-button" id="reviewDraft" type="button" hidden>生成核对预览</button>
             <details class="pipeline-details" id="pipelineDetails">
-              <summary>查看各阶段详情</summary>
+              <summary>查看后端运行流程</summary>
               <div class="pipeline-stages" id="pipelineStages" hidden></div>
             </details>
           </div>
@@ -176,6 +164,6 @@
     </main>
   </div>
 
-  <script src="script.js?v=20260828-execution-flow1"></script>
+  <script src="script.js?v=20260828-backend-activity1"></script>
 </body>
 </html>

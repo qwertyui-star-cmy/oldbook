@@ -39,13 +39,8 @@
   const progressBar = document.getElementById("progressBar");
   const progressDetail = document.getElementById("progressDetail");
   const workMotion = document.getElementById("workMotion");
-  const workerLanes = document.getElementById("workerLanes");
-  const ocrFlowStep = document.getElementById("ocrFlowStep");
-  const alignFlowStep = document.getElementById("alignFlowStep");
-  const layerFlowStep = document.getElementById("layerFlowStep");
-  const ocrFlowProgress = document.getElementById("ocrFlowProgress");
-  const alignFlowProgress = document.getElementById("alignFlowProgress");
-  const layerFlowProgress = document.getElementById("layerFlowProgress");
+  const backendActivityTitle = document.getElementById("backendActivityTitle");
+  const backendActivityDetail = document.getElementById("backendActivityDetail");
   const diagnostics = document.getElementById("diagnostics");
   const pipelineDetails = document.getElementById("pipelineDetails");
   const pipelineStages = document.getElementById("pipelineStages");
@@ -73,41 +68,23 @@
     }[char]));
   }
 
-  function renderExecutionFlow(pipeline, backendActive) {
+  function renderBackendActivity(pipeline, backendActive) {
     const stages = Array.isArray(pipeline) ? pipeline : [];
-    const stageById = id => stages.find(stage => stage.id === id) || {};
-    const ocr = stageById("ocr");
-    const align = stageById("align");
-    const layer = stageById("layer");
-    const metrics = ocr.metrics || {};
+    const active = stages.find(stage => stage.state === "running")
+      || stages.find(stage => stage.state === "paused")
+      || stages.find(stage => stage.state === "waiting");
+    if (!active || !backendActivityTitle || !backendActivityDetail) return;
+    const metrics = active.metrics || {};
     const workers = Number(metrics.currentWorkers || metrics.workers || 0);
-    const maximum = Number(metrics.maxWorkers || metrics.workers || 0);
-    const activePages = Array.isArray(metrics.activePages) ? metrics.activePages.map(Number) : [];
-    const setStep = (element, stage) => {
-      if (!element) return;
-      element.classList.toggle("is-active", stage.state === "running");
-      element.classList.toggle("is-done", stage.state === "done");
-      element.classList.toggle("is-paused", stage.state === "paused");
-    };
-    setStep(ocrFlowStep, ocr);
-    setStep(alignFlowStep, align);
-    setStep(layerFlowStep, layer);
-    const formatProgress = stage => `${Number(stage.processed || 0)} / ${Number(stage.total || 0)}`;
-    if (ocrFlowProgress) ocrFlowProgress.textContent = formatProgress(ocr);
-    if (alignFlowProgress) alignFlowProgress.textContent = formatProgress(align);
-    if (layerFlowProgress) layerFlowProgress.textContent = formatProgress(layer);
-    if (workerLanes) {
-      workerLanes.innerHTML = workers > 0
-        ? Array.from({ length: workers }, (_, index) => {
-            const page = activePages[index];
-            const detail = Number.isFinite(page) && page > 0
-              ? `第 ${page} 页`
-              : (backendActive ? "运行中" : "已暂停");
-            return `<span><b>${index + 1}</b>${escapeHtml(detail)}</span>`;
-          }).join("")
-        : '<span class="is-idle">等待启动</span>';
-      workerLanes.setAttribute("aria-label", maximum > workers ? `当前 ${workers} 路，上限 ${maximum} 路` : `${workers} 路并行`);
-    }
+    const activePages = Array.isArray(metrics.activePages) ? metrics.activePages.map(Number).filter(Boolean) : [];
+    const progress = Number(active.total || 0)
+      ? `${Number(active.processed || 0)} / ${Number(active.total)} 页`
+      : "";
+    const workerText = workers > 0 ? `${workers} 路并行` : "";
+    const pageText = activePages.length ? `处理第 ${activePages.join("、")} 页` : "";
+    backendActivityTitle.textContent = active.label || "后台任务";
+    backendActivityDetail.textContent = [workerText, pageText, progress, backendActive ? "运行中" : "已暂停"]
+      .filter(Boolean).join(" · ");
   }
 
   function setBusy(label) {
@@ -475,6 +452,9 @@
         Number(metrics.etaSeconds || 0) > 0 ? `预计 ${formatDuration(Number(metrics.etaSeconds))}` : "",
         Number(metrics.cachedPages || 0) > 0 ? `缓存 ${Number(metrics.cachedPages)} 页` : "",
         Number(metrics.newlyOcrPages || 0) > 0 ? `新 OCR ${Number(metrics.newlyOcrPages)} 页` : "",
+        Array.isArray(metrics.activePages) && metrics.activePages.length
+          ? `处理第 ${metrics.activePages.map(Number).filter(Boolean).join("、")} 页`
+          : "",
         Number(metrics.freeMemoryMB || 0) > 0 ? `可用内存 ${(Number(metrics.freeMemoryMB) / 1024).toFixed(1)} GB` : "",
       ].filter(Boolean);
       return `
@@ -606,7 +586,7 @@
         })
       : [];
     const activeMetrics = activeStage?.metrics || {};
-    renderExecutionFlow(payload.pipeline, backendActive);
+    renderBackendActivity(payload.pipeline, backendActive);
     const displayedTotal = Number(activeStage?.total || total);
     const displayedProcessed = Number(activeStage?.processed ?? processed);
     const percent = displayedTotal
