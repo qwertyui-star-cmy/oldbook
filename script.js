@@ -39,6 +39,7 @@
   const progressBar = document.getElementById("progressBar");
   const progressDetail = document.getElementById("progressDetail");
   const workMotion = document.getElementById("workMotion");
+  const parallelStatus = document.getElementById("parallelStatus");
   const diagnostics = document.getElementById("diagnostics");
   const pipelineDetails = document.getElementById("pipelineDetails");
   const pipelineStages = document.getElementById("pipelineStages");
@@ -562,6 +563,14 @@
         })
       : [];
     const activeMetrics = activeStage?.metrics || {};
+    const currentWorkers = Number(activeMetrics.currentWorkers || activeMetrics.workers || 0);
+    const maxWorkers = Number(activeMetrics.maxWorkers || activeMetrics.workers || 0);
+    if (parallelStatus) {
+      parallelStatus.hidden = currentWorkers <= 0;
+      parallelStatus.textContent = maxWorkers > currentWorkers
+        ? `并行 ${currentWorkers} 路（上限 ${maxWorkers} 路）`
+        : `并行 ${currentWorkers} 路`;
+    }
     const displayedTotal = Number(activeStage?.total || total);
     const displayedProcessed = Number(activeStage?.processed ?? processed);
     const percent = displayedTotal

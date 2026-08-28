@@ -140,11 +140,12 @@
                 <button class="progress-pause" id="pauseProgress" type="button" disabled>暂停</button>
               </div>
             </div>
-            <div class="work-motion" id="workMotion" aria-hidden="true">
+            <div class="work-motion" id="workMotion">
               <div class="activity-particles">
                 <span></span><span></span><span></span><span></span><span></span>
                 <span></span><span></span><span></span><span></span>
               </div>
+              <strong class="parallel-status" id="parallelStatus" hidden>并行 -- 路</strong>
             </div>
             <progress id="progressBar" max="100" value="0"></progress>
             <p id="progressDetail">任务会在本地继续运行。</p>
@@ -164,6 +165,6 @@
     </main>
   </div>
 
-  <script src="script.js?v=20260826-result-link1"></script>
+  <script src="script.js?v=20260828-parallel-status1"></script>
 </body>
 </html>

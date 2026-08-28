@@ -853,6 +853,24 @@ button, input, select { font: inherit; }
   justify-content: space-between;
 }
 
+.parallel-status {
+  position: absolute;
+  right: 14px;
+  top: 50%;
+  transform: translateY(-50%);
+  min-width: 82px;
+  padding: 4px 9px;
+  border: 1px solid rgba(47, 144, 185, .28);
+  border-radius: 5px;
+  background: rgba(255, 255, 255, .88);
+  color: var(--cloud-deep);
+  font-size: 13px;
+  line-height: 1.25;
+  text-align: center;
+}
+
+.parallel-status[hidden] { display: none; }
+
 .work-motion.is-running {
   opacity: 1;
 }
