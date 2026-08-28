@@ -12,7 +12,7 @@ from unittest.mock import patch
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
-from PIL import Image
+from PIL import Image, ImageDraw
 from pypdf import PdfReader, PdfWriter
 from pypdf.generic import ContentStream
 
@@ -119,6 +119,18 @@ class EngineTests(unittest.TestCase):
 
         self.assertEqual(result, ["甲", "乙", "丙", "丁"])
         self.assertEqual(seen_sizes, [(236, 436)])
+
+    def test_full_page_ocr_explicitly_restores_detection_mode(self):
+        calls = []
+
+        def fake_ocr(_image, **kwargs):
+            calls.append(kwargs)
+            return SimpleNamespace(boxes=[], txts=[], scores=[])
+
+        with patch.object(engine, "get_ocr_engine", return_value=fake_ocr):
+            engine.ocr_image_payload(Image.new("RGB", (300, 400), "white"), "horizontal")
+
+        self.assertEqual(calls, [{"use_det": True, "use_cls": True, "use_rec": True}])
 
     def test_vertical_two_column_fallback_uses_detected_column_edges(self):
         image = Image.new("RGB", (420, 600), "white")
@@ -314,6 +326,121 @@ class EngineTests(unittest.TestCase):
         self.assertTrue(positions)
         self.assertGreater(min(positions), 150)
         self.assertLess(max(positions), 175)
+
+    def test_ancient_vertical_coverage_detects_a_missing_ink_column(self):
+        image = Image.new("L", (1000, 1400), "white")
+        draw = ImageDraw.Draw(image)
+        centers = [700, 580, 460, 340]
+        for center in centers:
+            draw.rectangle((center - 18, 220, center + 18, 1180), fill="black")
+        items = []
+        for center in centers[:-1]:
+            items.append({
+                "text": "古籍正文",
+                "box": [[center - 20, 210], [center + 20, 210], [center + 20, 1190], [center - 20, 1190]],
+                "score": 0.98,
+            })
+
+        coverage = engine.evaluate_ocr_coverage(image.convert("RGB"), items, "vertical-single")
+
+        self.assertEqual(coverage["expectedColumns"], 4)
+        self.assertEqual(coverage["coveredColumns"], 3)
+        self.assertFalse(coverage["complete"])
+        self.assertAlmostEqual(coverage["missingColumns"][0]["cx"], 340, delta=3)
+
+    def test_ancient_vertical_coverage_rejects_a_partially_recognized_column(self):
+        image = Image.new("L", (700, 1400), "white")
+        draw = ImageDraw.Draw(image)
+        center = 420
+        for top in range(220, 1180, 110):
+            draw.rectangle((center - 22, top, center + 22, top + 70), fill="black")
+        items = [{
+            "text": "古籍正文",
+            "box": [[center - 24, 210], [center + 24, 210], [center + 24, 1190], [center - 24, 1190]],
+            "score": 0.98,
+        }]
+
+        coverage = engine.evaluate_ocr_coverage(image.convert("RGB"), items, "vertical-single")
+
+        self.assertEqual(coverage["expectedColumns"], 1)
+        self.assertEqual(coverage["coveredColumns"], 1)
+        self.assertEqual(len(coverage["weakColumns"]), 1)
+        self.assertFalse(coverage["complete"])
+
+    def test_ancient_vertical_coverage_does_not_count_toc_dots_as_missing_words(self):
+        image = Image.new("L", (700, 1400), "white")
+        draw = ImageDraw.Draw(image)
+        center = 420
+        draw.rectangle((center - 22, 210, center + 22, 370), fill="black")
+        for top in range(410, 1160, 35):
+            draw.ellipse((center - 7, top, center + 7, top + 14), fill="black")
+        items = [{
+            "text": "目录三六",
+            "box": [[center - 24, 200], [center + 24, 200], [center + 24, 1190], [center - 24, 1190]],
+            "score": 0.98,
+        }]
+
+        coverage = engine.evaluate_ocr_coverage(image.convert("RGB"), items, "vertical-single")
+
+        self.assertTrue(coverage["complete"])
+        self.assertTrue(engine.detect_ancient_vertical_columns(image)[0]["dottedLeader"])
+
+    def test_missing_vertical_column_retry_builds_positioned_item(self):
+        calls = []
+
+        def fake_ocr(image, **kwargs):
+            calls.append((image.size, kwargs))
+            return SimpleNamespace(txts=["補識別文字"], scores=[0.92])
+
+        missing = [{"x0": 390, "x1": 430, "y0": 120, "y1": 680, "cx": 410}]
+        image = Image.new("RGB", (800, 900), "white")
+
+        with patch.object(engine, "get_ocr_engine", return_value=fake_ocr):
+            items = engine.supplement_missing_vertical_columns(image, [], missing)
+
+        self.assertEqual(calls[0][1], {"use_det": False, "use_cls": False, "use_rec": True, "text_score": 0.0})
+        self.assertGreaterEqual(calls[0][0][1], engine.MIN_COLUMN_OCR_WIDTH)
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["text"], "補識別文字")
+        self.assertEqual(items[0]["origin"], "missing-column-recognition")
+        self.assertGreater(items[0]["box"][0][1], 0)
+        self.assertAlmostEqual(items[0]["cx"], 410, delta=12)
+
+    def test_full_page_ocr_retries_high_dpi_only_when_coverage_is_incomplete(self):
+        rendered = []
+
+        def fake_render(_pdf, _pages, dpi):
+            rendered.append(dpi)
+            return [Image.new("RGB", (dpi * 4, dpi * 6), "white")]
+
+        payloads = [
+            {"text": "初识", "coverage": {"complete": False}},
+            {"text": "二次识别", "coverage": {"complete": False}},
+            {"text": "完整识别", "coverage": {"complete": True}},
+        ]
+        with (
+            patch.object(engine, "render_page_images", side_effect=fake_render),
+            patch.object(engine, "ocr_image_payload", side_effect=payloads),
+        ):
+            payload = engine.adaptive_full_page_ocr(Path("book.pdf"), 1, "vertical-single")
+
+        self.assertEqual(rendered, [engine.FULL_OCR_BASE_DPI, *engine.FULL_OCR_RETRY_DPIS])
+        self.assertEqual(payload["text"], "完整识别")
+        self.assertEqual(payload["renderDpi"], engine.FULL_OCR_RETRY_DPIS[-1])
+        self.assertEqual(payload["attemptedDpis"], [engine.FULL_OCR_BASE_DPI, *engine.FULL_OCR_RETRY_DPIS])
+        self.assertTrue(payload["adaptiveRetry"])
+
+    def test_full_page_ocr_keeps_base_dpi_when_coverage_is_complete(self):
+        with (
+            patch.object(engine, "render_page_images", return_value=[Image.new("RGB", (600, 900), "white")]) as render,
+            patch.object(engine, "ocr_image_payload", return_value={"text": "完整", "coverage": {"complete": True}}),
+        ):
+            payload = engine.adaptive_full_page_ocr(Path("book.pdf"), 1, "vertical-single")
+
+        render.assert_called_once_with(Path("book.pdf"), [1], dpi=engine.FULL_OCR_BASE_DPI)
+        self.assertEqual(payload["renderDpi"], engine.FULL_OCR_BASE_DPI)
+        self.assertEqual(payload["attemptedDpis"], [engine.FULL_OCR_BASE_DPI])
+        self.assertNotIn("adaptiveRetry", payload)
 
     def test_word_style_frame_reduces_font_instead_of_overflowing(self):
         usable_w = 595 - 2 * (3 * 72 / 2.54)
@@ -922,6 +1049,7 @@ class EngineTests(unittest.TestCase):
             with (
                 patch.object(engine, "full_ocr_cache_path", return_value=cached),
                 patch.object(engine, "full_ocr_cache_ready", return_value=True),
+                patch.object(engine, "read_full_ocr_layout", return_value={"coverage": {"complete": True}}),
                 patch.object(engine, "ocr_page_text", side_effect=["目录 OCR", ""]),
                 patch.object(engine, "classify_page", side_effect=classify),
             ):
@@ -931,6 +1059,30 @@ class EngineTests(unittest.TestCase):
         self.assertEqual([item["kind"] for item in manifest], ["body", "ocr", "blank"])
         self.assertEqual(manifest[1]["textOrigin"], "page-ocr")
         self.assertEqual(manifest[2]["text"], "")
+
+    def test_incomplete_ocr_coverage_stays_unresolved(self):
+        manifest = [{"page": 1, "kind": "unresolved", "text": ""}]
+        reader = SimpleNamespace(pages=[SimpleNamespace()])
+        coverage = {
+            "complete": False,
+            "missingColumns": [{"cx": 320}],
+            "weakColumns": [{"cx": 420}],
+        }
+
+        with (
+            patch.object(engine, "full_ocr_cache_ready", return_value=True),
+            patch.object(engine, "read_full_ocr_layout", return_value={"coverage": coverage}),
+            patch.object(engine, "ocr_page_text", return_value="不完整 OCR"),
+            patch.object(engine, "classify_page", return_value={"kind": "body"}),
+        ):
+            completed = engine.fill_non_authoritative_ocr({}, reader, manifest, "vertical-single")
+
+        self.assertEqual(completed, 1)
+        self.assertEqual(manifest[0]["kind"], "unresolved")
+        self.assertEqual(manifest[0]["status"], "OCR 覆盖不完整")
+        self.assertEqual(manifest[0]["text"], "")
+        self.assertEqual(manifest[0]["textOrigin"], "page-ocr-incomplete")
+        self.assertIn("2 条", manifest[0]["reason"])
 
     def test_chapter_transition_title_page_can_attach_to_next_unit_prefix(self):
         previous_unit = engine.SourceUnit("志第一", "chapter-1", "前章正文结束", kind="epub")

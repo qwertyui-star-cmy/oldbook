@@ -94,8 +94,12 @@ TEXT_FONT = "HanText"
 TEXT_FONT_REGISTERED = False
 EXTB_TEXT_FONT = "HanTextExtB"
 EXTB_TEXT_FONT_REGISTERED = False
-LAYOUT_ENGINE_VERSION = "next-page-start-v19-positioned-ocr"
+LAYOUT_ENGINE_VERSION = "next-page-start-v23-multistage-ancient-ocr"
 ANCHOR_CACHE_VERSION = 11
+FULL_OCR_BASE_DPI = 150
+FULL_OCR_RETRY_DPIS = (190, 230)
+MIN_COLUMN_OCR_WIDTH = 64
+MAX_COLUMN_OCR_SCALE = 2.0
 TEXT_FONT_CANDIDATES = [
     Path(r"C:\Windows\Fonts\STSONG.TTF"),
     Path(r"C:\Windows\Fonts\simsun.ttc"),
@@ -2104,18 +2108,198 @@ def sort_ocr_items(boxes, txts, scores, layout: str) -> list[str]:
     return [item["text"] for item in ordered_ocr_items(boxes, txts, scores, layout)]
 
 
-def ocr_image_payload(image: Image.Image, layout: str) -> dict:
+def ocr_item_bounds(item: dict) -> tuple[float, float, float, float] | None:
+    points = item.get("box") or []
+    if len(points) < 2:
+        return None
+    try:
+        xs = [float(point[0]) for point in points]
+        ys = [float(point[1]) for point in points]
+    except (TypeError, ValueError, IndexError):
+        return None
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+def detect_ancient_vertical_columns(image: Image.Image) -> list[dict]:
+    """Find substantial ink columns independently of OCR recognition results."""
+    gray = image.convert("L")
+    width, height = gray.size
+    y0, y1 = round(height * .08), round(height * .92)
+    body_ink = gray.crop((0, y0, width, y1)).point(lambda value: 255 if value < 170 else 0)
+    body_height = max(1, y1 - y0)
+    projected = body_ink.resize((width, 1), Image.Resampling.BOX)
+    projected_pixels = projected.load()
+    counts = [round(projected_pixels[x, 0] * body_height / 255) for x in range(width)]
+    mask = [count > body_height * .025 for count in counts]
+    column_runs = runs(mask, 2)
+    min_width = max(8, round(width * .012))
+    columns = []
+    for start, end in column_runs:
+        run_width = end - start + 1
+        peak = int(max(counts[start:end + 1], default=0))
+        if run_width < min_width or peak < body_height * .08:
+            continue
+        expand = max(2, round(run_width * .08))
+        left, right = max(0, start - expand), min(width, end + expand + 1)
+        column_ink = gray.crop((left, 0, right, height)).point(lambda value: 255 if value < 180 else 0)
+        projected_rows = column_ink.resize((1, height), Image.Resampling.BOX)
+        projected_row_pixels = projected_rows.load()
+        row_counts = [round(projected_row_pixels[0, row] * (right - left) / 255) for row in range(height)]
+        row_threshold = max(2, round((right - left) * .06))
+        rows_with_ink = [row for row, count in enumerate(row_counts) if count >= row_threshold]
+        if not rows_with_ink:
+            continue
+        top, bottom = rows_with_ink[0], rows_with_ink[-1] + 1
+        if bottom - top < height * .055:
+            continue
+        glyph_runs = runs([count >= row_threshold for count in row_counts[top:bottom]], 2)
+        short_run_ratio = (
+            sum(1 for run_start, run_end in glyph_runs if run_end - run_start + 1 < run_width * .40)
+            / max(1, len(glyph_runs))
+        )
+        dotted_leader = len(glyph_runs) >= 12 and short_run_ratio >= .65
+        estimated_text_chars = min(
+            len(glyph_runs),
+            max(1, round((bottom - top) / max(1.0, run_width * 1.15))),
+        )
+        columns.append({
+            "x0": int(start), "x1": int(end + 1), "y0": top, "y1": bottom,
+            "cx": round((start + end + 1) / 2, 2), "inkPeak": peak,
+            "inkGlyphRuns": len(glyph_runs),
+            "estimatedTextChars": estimated_text_chars,
+            "dottedLeader": dotted_leader,
+            "shortInkRunRatio": round(short_run_ratio, 3),
+        })
+    return columns
+
+
+def evaluate_ocr_coverage(image: Image.Image, items: list[dict], layout: str) -> dict:
+    if not layout.startswith("vertical"):
+        return {"mode": "horizontal", "complete": True, "expectedColumns": 0, "coveredColumns": 0, "missingColumns": []}
+    columns = detect_ancient_vertical_columns(image)
+    item_bounds = [(item, bounds) for item in items if (bounds := ocr_item_bounds(item)) is not None]
+    missing = []
+    weak = []
+    covered = 0
+    for column in columns:
+        col_width = max(1.0, float(column["x1"] - column["x0"]))
+        tolerance = max(col_width * .7, image.width * .012)
+        matched_items = []
+        for item, (x0, y0, x1, y1) in item_bounds:
+            center = (x0 + x1) / 2
+            vertical_overlap = max(0.0, min(y1, column["y1"]) - max(y0, column["y0"]))
+            if abs(center - column["cx"]) <= tolerance and vertical_overlap >= min(y1 - y0, column["y1"] - column["y0"]) * .18:
+                matched_items.append(item)
+        if matched_items:
+            covered += 1
+            recognized_chars = sum(len(canonical_output_text(str(item.get("text") or ""))) for item in matched_items)
+            expected_chars = int(column.get("estimatedTextChars") or 0)
+            column["recognizedChars"] = recognized_chars
+            if not column.get("dottedLeader") and expected_chars >= 6 and recognized_chars < expected_chars * .65:
+                weak.append(column)
+        else:
+            missing.append(column)
+    expected = len(columns)
+    usable = expected - len(missing) - len(weak)
+    return {
+        "mode": "ancient-vertical-columns-v1",
+        "complete": not missing and not weak,
+        "expectedColumns": expected,
+        "coveredColumns": covered,
+        "usableColumns": usable,
+        "coveragePercent": round(100 * usable / max(1, expected), 1),
+        "missingColumns": missing,
+        "weakColumns": weak,
+    }
+
+
+def ocr_text_overlap(left: str, right: str, limit: int = 6) -> int:
+    maximum = min(limit, len(left), len(right))
+    for size in range(maximum, 0, -1):
+        if left[-size:] == right[:size]:
+            return size
+    return 0
+
+
+def supplement_missing_vertical_columns(image: Image.Image, items: list[dict], missing: list[dict]) -> list[dict]:
+    engine = get_ocr_engine()
+    if engine is None or not missing:
+        return items
+    merged = list(items)
+    for column in missing:
+        column_width = max(1, int(column["x1"] - column["x0"]))
+        x_pad = max(8, round(column_width * .12))
+        crop_x0 = max(0, int(column["x0"]) - x_pad)
+        crop_x1 = min(image.width, int(column["x1"]) + x_pad)
+        segment_height = max(720, min(920, column_width * 8))
+        overlap = min(100, max(60, segment_height // 10))
+        cursor = max(0, int(column["y0"]) - overlap)
+        final_y = min(image.height, int(column["y1"]) + overlap)
+        assembled = ""
+        column_items = []
+        while cursor < final_y:
+            segment_y1 = min(final_y, cursor + segment_height)
+            crop = image.crop((crop_x0, cursor, crop_x1, segment_y1)).convert("RGB")
+            horizontal = crop.transpose(Image.Transpose.ROTATE_90)
+            scale = min(MAX_COLUMN_OCR_SCALE, max(1.0, MIN_COLUMN_OCR_WIDTH / max(1, crop.width)))
+            if scale > 1.0:
+                horizontal = horizontal.resize(
+                    (round(horizontal.width * scale), round(horizontal.height * scale)),
+                    Image.Resampling.LANCZOS,
+                )
+            result = engine(horizontal, use_det=False, use_cls=False, use_rec=True, text_score=0.0)
+            recognized = clean_ocr_text("".join(str(value or "") for value in (result.txts or [])))
+            recognized = canonical_output_text(recognized)
+            if recognized:
+                duplicate = ocr_text_overlap(assembled, recognized)
+                trimmed = recognized[duplicate:]
+                if trimmed:
+                    adjusted_y0 = cursor + round((segment_y1 - cursor) * duplicate / max(1, len(recognized)))
+                    score_values = [float(value or 0) for value in (result.scores or [])]
+                    column_items.append({
+                        "text": trimmed,
+                        "box": [[crop_x0, adjusted_y0], [crop_x1, adjusted_y0], [crop_x1, segment_y1], [crop_x0, segment_y1]],
+                        "cx": (crop_x0 + crop_x1) / 2,
+                        "cy": (adjusted_y0 + segment_y1) / 2,
+                        "score": sum(score_values) / max(1, len(score_values)),
+                        "origin": "missing-column-recognition",
+                    })
+                    assembled += trimmed
+            if segment_y1 >= final_y:
+                break
+            cursor = segment_y1 - overlap
+        if column_items:
+            tolerance = max(column_width * .7, image.width * .012)
+            retained = []
+            for item in merged:
+                bounds = ocr_item_bounds(item)
+                center = (bounds[0] + bounds[2]) / 2 if bounds else float(item.get("cx") or 0)
+                if abs(center - float(column["cx"])) > tolerance:
+                    retained.append(item)
+            merged = retained + column_items
+    merged.sort(key=lambda item: (-float(item.get("cx") or 0), float(item.get("cy") or 0)))
+    return merged
+
+
+def ocr_image_payload(image: Image.Image, layout: str, ancient_layout_aware: bool = False) -> dict:
     engine = get_ocr_engine()
     if engine is None:
         return {"text": "", "items": [], "imageSize": list(image.size), "layout": layout}
-    result = engine(image)
+    result = engine(image, use_det=True, use_cls=True, use_rec=True)
     items = ordered_ocr_items(result.boxes, result.txts, result.scores, layout)
+    coverage = evaluate_ocr_coverage(image, items, layout) if ancient_layout_aware else {"complete": True, "mode": "not-requested"}
+    if ancient_layout_aware and not coverage.get("complete") and layout.startswith("vertical"):
+        retry_columns = list(coverage.get("missingColumns") or []) + list(coverage.get("weakColumns") or [])
+        unique_retry_columns = {round(float(column.get("cx") or 0), 1): column for column in retry_columns}
+        items = supplement_missing_vertical_columns(image, items, list(unique_retry_columns.values()))
+        coverage = evaluate_ocr_coverage(image, items, layout)
     text = clean_ocr_text("\n".join(item["text"] for item in items))
     return {
         "text": text,
         "items": items,
         "imageSize": list(image.size),
         "layout": layout,
+        "coverage": coverage,
     }
 
 
@@ -2835,8 +3019,7 @@ def ocr_page_text(job: dict, page_no: int, layout: str, anchors_only: bool = Tru
             if cleaned != text:
                 atomic_write_text(cache_path, cleaned)
             return cleaned
-    image = render_page_image(Path(job["pdf"]), page_no, dpi=160)
-    payload = ocr_image_payload(image, layout)
+    payload = adaptive_full_page_ocr(Path(job["pdf"]), page_no, layout)
     text = str(payload.get("text") or "")
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     atomic_write_text(cache_path, text)
@@ -2846,13 +3029,13 @@ def ocr_page_text(job: dict, page_no: int, layout: str, anchors_only: bool = Tru
 
 def full_ocr_cache_path(job: dict, page_no: int, layout: str) -> Path:
     job_id = str(job.get("id") or "").strip()
-    cache_name = f"page-{page_no:04d}-ocr-full-v3-{layout}.txt"
+    cache_name = f"page-{page_no:04d}-ocr-full-v7-{layout}.txt"
     return job_paths(job_id).root / cache_name if job_id else Path(job["pdf"]).parent / cache_name
 
 
 def full_ocr_layout_path(job: dict, page_no: int, layout: str) -> Path:
     job_id = str(job.get("id") or "").strip()
-    cache_name = f"page-{page_no:04d}-ocr-layout-v2-{layout}.json"
+    cache_name = f"page-{page_no:04d}-ocr-layout-v6-{layout}.json"
     return job_paths(job_id).root / cache_name if job_id else Path(job["pdf"]).parent / cache_name
 
 
@@ -2873,6 +3056,24 @@ def read_full_ocr_layout(job: dict, page_no: int, layout: str) -> dict | None:
     return None
 
 
+def adaptive_full_page_ocr(pdf_path: Path, page_no: int, layout: str, persistent: bool = False) -> dict:
+    """Use a compact first pass and spend extra pixels only on incomplete ancient pages."""
+    render = render_page_images_persistent if persistent else render_page_images
+    attempted_dpis = []
+    payload = {}
+    for dpi in (FULL_OCR_BASE_DPI, *FULL_OCR_RETRY_DPIS):
+        image = render(pdf_path, [page_no], dpi=dpi)[0]
+        payload = ocr_image_payload(image, layout, ancient_layout_aware=True)
+        attempted_dpis.append(dpi)
+        payload["renderDpi"] = dpi
+        payload["attemptedDpis"] = list(attempted_dpis)
+        if not layout.startswith("vertical") or (payload.get("coverage") or {}).get("complete"):
+            break
+    if len(attempted_dpis) > 1:
+        payload["adaptiveRetry"] = True
+    return payload
+
+
 def full_page_ocr_worker(payload: tuple[str, int, str]) -> tuple[int, str, str]:
     job_id, page_no, layout = payload
     try:
@@ -2880,8 +3081,7 @@ def full_page_ocr_worker(payload: tuple[str, int, str]) -> tuple[int, str, str]:
         cache_path = full_ocr_cache_path(job, page_no, layout)
         if full_ocr_cache_ready(job, page_no, layout):
             return page_no, ocr_page_text(job, page_no, layout, anchors_only=False), ""
-        image = render_page_images_persistent(Path(job["pdf"]), [page_no], dpi=160)[0]
-        ocr_payload = ocr_image_payload(image, layout)
+        ocr_payload = adaptive_full_page_ocr(Path(job["pdf"]), page_no, layout, persistent=True)
         text = str(ocr_payload.get("text") or "")
         atomic_write_text(cache_path, text)
         atomic_write_json(full_ocr_layout_path(job, page_no, layout), ocr_payload)
@@ -3822,15 +4022,28 @@ def fill_non_authoritative_ocr(
         nonlocal completed
         item = by_page[page_no]
         decision = classify_page(job, reader, page_no, layout, text)
+        geometry = read_full_ocr_layout(job, page_no, layout) or {}
+        coverage = geometry.get("coverage") or {}
         if decision.get("kind") == "blank":
             item.update({
                 "kind": "blank", "status": "空白页", "text": "", "confidence": 100,
                 "textOrigin": "blank", "reason": decision.get("reason") or "空白页",
             })
+        elif coverage and not coverage.get("complete", False):
+            missing_count = len(coverage.get("missingColumns") or [])
+            weak_count = len(coverage.get("weakColumns") or [])
+            problem_count = missing_count + weak_count
+            item.update({
+                "kind": "unresolved", "status": "OCR 覆盖不完整", "text": "", "confidence": 0,
+                "sourceTitle": "本页 OCR", "sourceUrl": "", "textOrigin": "page-ocr-incomplete",
+                "ocrCoverage": coverage,
+                "reason": f"原图仍有 {problem_count} 条明显文字列缺失或文字量异常；已阻止不完整文字进入成品。",
+            })
         else:
             item.update({
                 "kind": "ocr", "status": "整页 OCR", "text": text, "confidence": 70 if text.strip() else 0,
                 "sourceTitle": "本页 OCR", "sourceUrl": "", "textOrigin": "page-ocr",
+                "ocrCoverage": coverage,
                 "reason": "本页未进入权威文本层；整页 OCR 仅用于本页搜索，不参与任何权威页边界。",
             })
         completed += 1
