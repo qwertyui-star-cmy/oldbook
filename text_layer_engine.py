@@ -3323,9 +3323,9 @@ def full_ocr_cache_ready(job: dict, page_no: int, layout: str) -> bool:
         return False
     geometry = read_full_ocr_layout(job, page_no, layout) or {}
     coverage = geometry.get("coverage") or {}
-    if not coverage or coverage.get("complete", False):
-        return True
     text = text_path.read_text(encoding="utf-8", errors="ignore")
+    if (not coverage or coverage.get("complete", False)) and ocr_geometry_matches_text(geometry, text):
+        return True
     decision = cached_page_classification(job, page_no, layout, text)
     return bool(decision and decision.get("kind") == "blank")
 
@@ -3341,6 +3341,19 @@ def read_full_ocr_layout(job: dict, page_no: int, layout: str) -> dict | None:
     except (OSError, ValueError, TypeError, json.JSONDecodeError):
         pass
     return None
+
+
+def ocr_geometry_matches_text(geometry: dict | None, text: str) -> bool:
+    if not text.strip():
+        return True
+    if not geometry or len(geometry.get("imageSize") or []) != 2:
+        return False
+    positioned_text = "".join(
+        str(item.get("text") or "")
+        for item in geometry.get("items") or []
+        if ocr_item_bounds(item) is not None
+    )
+    return canonical_output_text(positioned_text) == canonical_output_text(text)
 
 
 def adaptive_full_page_ocr(
@@ -3422,14 +3435,24 @@ def full_page_ocr_worker(payload: tuple[str, int, str]) -> tuple[int, str, str]:
         base_payload = None
         existing_payload = read_full_ocr_layout(job, page_no, layout)
         existing_coverage = (existing_payload or {}).get("coverage") or {}
-        if existing_payload and existing_coverage and not existing_coverage.get("complete", False):
+        existing_text = str((existing_payload or {}).get("text") or "")
+        existing_needs_retry = bool(existing_payload) and (
+            (bool(existing_coverage) and not existing_coverage.get("complete", False))
+            or not ocr_geometry_matches_text(existing_payload, existing_text)
+        )
+        if existing_needs_retry:
             high_image = render_page_images_persistent(
                 Path(job["pdf"]), [page_no], dpi=STUBBORN_FULL_OCR_DPI,
             )[0]
             high_payload = ocr_image_payload(high_image, layout, ancient_layout_aware=True)
             previous_percent = float(existing_coverage.get("coveragePercent") or 0)
             high_percent = float((high_payload.get("coverage") or {}).get("coveragePercent") or 0)
-            ocr_payload = high_payload if high_percent >= previous_percent else existing_payload
+            high_geometry_ready = ocr_geometry_matches_text(high_payload, str(high_payload.get("text") or ""))
+            ocr_payload = (
+                high_payload
+                if high_geometry_ready and (high_percent >= previous_percent or not ocr_geometry_matches_text(existing_payload, existing_text))
+                else existing_payload
+            )
             attempted = list(existing_payload.get("attemptedDpis") or [])
             if STUBBORN_FULL_OCR_DPI not in attempted:
                 attempted.append(STUBBORN_FULL_OCR_DPI)
@@ -3468,7 +3491,11 @@ def base_full_page_ocr_worker(payload: tuple[str, int, str]) -> tuple[int, bool,
             return page_no, True, ocr_page_text(job, page_no, layout, anchors_only=False), ""
         existing_payload = read_full_ocr_layout(job, page_no, layout)
         existing_coverage = (existing_payload or {}).get("coverage") or {}
-        if existing_payload and existing_coverage and not existing_coverage.get("complete", False):
+        existing_text = str((existing_payload or {}).get("text") or "")
+        if existing_payload and (
+            (existing_coverage and not existing_coverage.get("complete", False))
+            or not ocr_geometry_matches_text(existing_payload, existing_text)
+        ):
             text = full_ocr_cache_path(job, page_no, layout).read_text(encoding="utf-8", errors="ignore")
             return page_no, False, text, ""
         base_path = full_ocr_base_path(job, page_no, layout)
@@ -3481,8 +3508,11 @@ def base_full_page_ocr_worker(payload: tuple[str, int, str]) -> tuple[int, bool,
             base_payload["attemptedDpis"] = [FULL_OCR_BASE_DPI]
             base_payload["regionalRetries"] = []
             atomic_write_json(base_path, base_payload)
-        complete = bool((base_payload.get("coverage") or {}).get("complete")) or not layout.startswith("vertical")
         text = str(base_payload.get("text") or "")
+        complete = (
+            (bool((base_payload.get("coverage") or {}).get("complete")) or not layout.startswith("vertical"))
+            and ocr_geometry_matches_text(base_payload, text)
+        )
         if complete:
             atomic_write_text(full_ocr_cache_path(job, page_no, layout), text)
             atomic_write_json(full_ocr_layout_path(job, page_no, layout), base_payload)
@@ -4415,6 +4445,22 @@ def fill_non_authoritative_ocr(
     candidates = [item for item in manifest if item.get("kind") != "body"]
     if not candidates:
         return 0
+    if status_job_id:
+        cached_layer_pages = len(list((job_paths(status_job_id).root / "pages").glob("page-*.pdf")))
+        update_pipeline_stage(
+            status_job_id, "layer", "waiting", state="planning",
+            processed=0, total=len(manifest),
+            detail=(
+                f"已有 {cached_layer_pages} 个中间页缓存；等待 OCR 门禁通过后统一验证写入"
+                if cached_layer_pages else
+                "等待 OCR 门禁通过后开始文字层写入"
+            ),
+            metrics={
+                "cachedLayerPages": cached_layer_pages,
+                "verifiedThisRun": 0,
+                "waitingForOcrGate": True,
+            },
+        )
     by_page = {int(item["page"]): item for item in candidates}
     completed = 0
     checked = 0
@@ -4435,6 +4481,14 @@ def fill_non_authoritative_ocr(
             item.update({
                 "kind": "blank", "status": "空白页", "text": "", "confidence": 100,
                 "textOrigin": "blank", "reason": decision.get("reason") or "空白页",
+            })
+        elif not ocr_geometry_matches_text(geometry, text):
+            item.update({
+                "kind": "unresolved", "status": "OCR 坐标不完整", "text": "", "confidence": 0,
+                "sourceTitle": "本页 OCR", "sourceUrl": "", "textOrigin": "page-ocr-incomplete",
+                "ocrCoverage": coverage,
+                "ocrAttempts": list(geometry.get("attemptedDpis") or []),
+                "reason": "OCR 文字与页面坐标没有完整对应；已阻止使用权威页排版方式代替。",
             })
         elif coverage and not coverage.get("complete", False):
             missing_count = len(coverage.get("missingColumns") or [])
@@ -5324,8 +5378,11 @@ def overlay_for_page(
     packet = io.BytesIO()
     width, height = float(page.mediabox.width), float(page.mediabox.height)
     overlay_canvas = canvas.Canvas(packet, pagesize=(width, height), pageCompression=1)
-    positioned = draw_ocr_positioned_text(overlay_canvas, text, width, height, ocr_geometry) if ocr_geometry else {"placed": 0}
-    if not positioned.get("placed"):
+    if ocr_geometry is not None:
+        positioned = draw_ocr_positioned_text(overlay_canvas, text, width, height, ocr_geometry)
+        if text.strip() and not positioned.get("placed"):
+            raise ValueError("非权威 OCR 页缺少可用文字坐标，已停止写入。")
+    else:
         draw_word_style_authoritative_text(overlay_canvas, text, width, height, layout)
     overlay_canvas.showPage()
     overlay_canvas.save()

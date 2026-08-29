@@ -352,6 +352,19 @@ class EngineTests(unittest.TestCase):
         self.assertGreater(min(positions), 150)
         self.assertLess(max(positions), 175)
 
+    def test_pure_ocr_overlay_never_falls_back_to_authoritative_layout(self):
+        packet = io.BytesIO()
+        from reportlab.pdfgen import canvas
+
+        source_canvas = canvas.Canvas(packet, pagesize=(200, 300), pageCompression=1)
+        source_canvas.showPage()
+        source_canvas.save()
+        packet.seek(0)
+        page = PdfReader(packet, strict=False).pages[0]
+
+        with self.assertRaisesRegex(ValueError, "缺少可用文字坐标"):
+            engine.overlay_for_page(page, "非权威 OCR 文字", [], "vertical-single", None, {})
+
     def test_ancient_vertical_coverage_detects_a_missing_ink_column(self):
         image = Image.new("L", (1000, 1400), "white")
         draw = ImageDraw.Draw(image)
@@ -1169,7 +1182,11 @@ class EngineTests(unittest.TestCase):
             with (
                 patch.object(engine, "full_ocr_cache_path", return_value=cached),
                 patch.object(engine, "full_ocr_cache_ready", return_value=True),
-                patch.object(engine, "read_full_ocr_layout", return_value={"coverage": {"complete": True}}),
+                patch.object(engine, "read_full_ocr_layout", return_value={
+                    "imageSize": [600, 900],
+                    "items": [{"text": "目录 OCR", "box": [[400, 100], [440, 100], [440, 700], [400, 700]]}],
+                    "coverage": {"complete": True},
+                }),
                 patch.object(engine, "ocr_page_text", side_effect=["目录 OCR", ""]),
                 patch.object(engine, "classify_page", side_effect=classify),
             ):
@@ -1191,7 +1208,11 @@ class EngineTests(unittest.TestCase):
 
         with (
             patch.object(engine, "full_ocr_cache_ready", return_value=True),
-            patch.object(engine, "read_full_ocr_layout", return_value={"coverage": coverage}),
+            patch.object(engine, "read_full_ocr_layout", return_value={
+                "imageSize": [600, 900],
+                "items": [{"text": "不完整 OCR", "box": [[400, 100], [440, 100], [440, 700], [400, 700]]}],
+                "coverage": coverage,
+            }),
             patch.object(engine, "ocr_page_text", return_value="不完整 OCR"),
             patch.object(engine, "classify_page", return_value={"kind": "body"}),
         ):
