@@ -278,7 +278,7 @@
     if (jobLibraryLoading || (!force && now - lastJobLibraryLoad < 5000)) return;
     jobLibraryLoading = true;
     try {
-      const payload = await api("/api/jobs");
+      const payload = await api("/api/jobs", { timeoutMs: 8000 });
       lastJobLibraryLoad = Date.now();
       const jobs = Array.isArray(payload.jobs) ? payload.jobs : [];
       jobLibraryTab.textContent = `任务库 ${jobs.length}`;

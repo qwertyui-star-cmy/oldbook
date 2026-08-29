@@ -18,7 +18,7 @@ from text_layer_engine import JOBS_DIR, TaskPaused, build_full_pdf, build_review
 ROOT = Path(__file__).resolve().parent
 LAST_JOB_FILE = JOBS_DIR.parent / "last-job.json"
 RUNNING_TASKS: dict[str, threading.Thread] = {}
-RUNNING_LOCK = threading.Lock()
+RUNNING_LOCK = threading.RLock()
 DIAGNOSTICS_CACHE: dict[str, tuple[tuple[int, int], dict]] = {}
 
 
