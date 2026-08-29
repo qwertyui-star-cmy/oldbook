@@ -5992,6 +5992,11 @@ def build_full_pdf(job_id: str, layout: str, stop_after: int | None = None) -> d
                 and cached_payload.get("engineVersion") == LAYOUT_ENGINE_VERSION
                 and cached_payload.get("layout") == selected_layout
                 and cached_payload.get("inputFingerprint") == job.get("inputFingerprint")
+                and not any(
+                    row.get("kind") == "unresolved"
+                    and row.get("textOrigin") == "page-ocr-incomplete"
+                    for row in cached_pages
+                )
             ):
                 manifest = cached_pages
                 manifest_reused = True
