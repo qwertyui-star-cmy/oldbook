@@ -5872,7 +5872,7 @@ def build_full_pdf(job_id: str, layout: str, stop_after: int | None = None) -> d
             reader,
             selected_layout,
             status_job_id=job_id,
-            commit_callback=commit_stream_page,
+            commit_callback=None,
         )
     for row in manifest:
         if row.get("kind") != "body" or not row.get("text"):
