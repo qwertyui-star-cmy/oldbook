@@ -143,6 +143,13 @@ PIPELINE_STAGES = (
 
 class TaskPaused(Exception):
     pass
+
+
+class VisualMismatchError(ValueError):
+    def __init__(self, pages: list[int]):
+        self.pages = sorted(set(int(page) for page in pages))
+        page_list = "、".join(str(page) for page in self.pages)
+        super().__init__(f"第 {page_list} 页扫描画面发生变化，已停止发布。")
 COMMON_GLYPH_VARIANTS = {
     "徳": "德",
     "髙": "高",
@@ -5617,6 +5624,7 @@ def validate_full_output(source_pdf: Path, output_pdf: Path, manifest: list[dict
         if manifest[index - 1].get("kind") != manifest[index].get("kind"):
             visual_pages.update((index, index + 1))
     checked = 0
+    mismatched_pages = []
     pages_to_check = sorted(visual_pages)[:12]
     if status_job_id:
         update_pipeline_stage(
@@ -5628,13 +5636,15 @@ def validate_full_output(source_pdf: Path, output_pdf: Path, manifest: list[dict
         source_image = render_page_image(source_pdf, page_no, dpi=72)
         output_image = render_page_image(output_pdf, page_no, dpi=72)
         if source_image.size != output_image.size or ImageChops.difference(source_image, output_image).getbbox() is not None:
-            raise ValueError(f"第 {page_no} 页扫描画面发生变化，已停止发布。")
+            mismatched_pages.append(page_no)
         checked += 1
         if status_job_id:
             update_pipeline_stage(
                 status_job_id, "visual-check", "running", state="running",
                 processed=checked, total=len(pages_to_check), detail=f"已核验扫描页 {page_no}",
             )
+    if mismatched_pages:
+        raise VisualMismatchError(mismatched_pages)
     if status_job_id:
         update_pipeline_stage(
             status_job_id, "visual-check", "done", state="running",
@@ -5905,7 +5915,26 @@ def build_full_pdf(job_id: str, layout: str, stop_after: int | None = None) -> d
                 processed=page_count, total=page_count, detail=f"合并完成：{assembly_backend}",
                 metrics={"backend": assembly_backend},
             )
-            validation = validate_full_output(pdf_path, building_pdf, manifest, status_job_id=job_id)
+            try:
+                validation = validate_full_output(pdf_path, building_pdf, manifest, status_job_id=job_id)
+            except VisualMismatchError as error:
+                page_list = "、".join(str(page) for page in error.pages)
+                update_pipeline_stage(
+                    job_id, "visual-check", "running", state="running",
+                    processed=0, total=len(error.pages),
+                    detail=f"发现异常页 {page_list}，正在从原扫描页自动重建",
+                    message="扫描画面抽检发现差异，正在自动修复异常页。",
+                    metrics={"repairAttempt": 1, "repairPages": error.pages},
+                )
+                for page_no in error.pages:
+                    page_out = page_dir / f"page-{page_no:05d}.pdf"
+                    page_out.unlink(missing_ok=True)
+                    page_out.with_suffix(".sha256").unlink(missing_ok=True)
+                    write_page_layer(job, reader, page_no, manifest[page_no - 1], selected_layout, page_out)
+                building_pdf.unlink(missing_ok=True)
+                assembly_backend = assemble_page_pdfs(page_files, building_pdf)
+                validation = validate_full_output(pdf_path, building_pdf, manifest, status_job_id=job_id)
+                validation["visualRepair"] = {"attempted": True, "pages": error.pages}
             validation["assembly"] = assembly_backend
             os.replace(building_pdf, final_pdf)
             stale_pdf.unlink(missing_ok=True)

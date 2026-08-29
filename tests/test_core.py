@@ -285,6 +285,22 @@ class EngineTests(unittest.TestCase):
             self.assertGreater(result["extractedChars"], 0)
             self.assertEqual(len(result["continuousTextHash"]), 64)
 
+    def test_full_validation_reports_every_sampled_visual_mismatch(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source.pdf"
+            output = root / "output.pdf"
+            Image.new("RGB", (200, 300), "white").save(source, "PDF", resolution=72)
+            Image.new("RGB", (200, 300), "black").save(output, "PDF", resolution=72)
+
+            with self.assertRaises(engine.VisualMismatchError) as raised:
+                engine.validate_full_output(
+                    source,
+                    output,
+                    [{"page": 1, "kind": "blank", "text": ""}],
+                )
+            self.assertEqual(raised.exception.pages, [1])
+
     def test_production_overlay_contains_one_exact_authoritative_stream(self):
         packet = io.BytesIO()
         from reportlab.pdfgen import canvas
