@@ -94,7 +94,7 @@ TEXT_FONT = "HanText"
 TEXT_FONT_REGISTERED = False
 EXTB_TEXT_FONT = "HanTextExtB"
 EXTB_TEXT_FONT_REGISTERED = False
-LAYOUT_ENGINE_VERSION = "next-page-start-v23-multistage-ancient-ocr"
+LAYOUT_ENGINE_VERSION = "next-page-start-v24-regional-ancient-ocr"
 ANCHOR_CACHE_VERSION = 12
 ANCHOR_BASE_DPI = 150
 ANCHOR_RETRY_DPI = 180
@@ -1538,6 +1538,61 @@ def render_page_images_persistent(pdf_path: Path, page_numbers: list[int], dpi: 
     return images
 
 
+def render_page_region(
+    pdf_path: Path,
+    page_no: int,
+    box: tuple[int, int, int, int],
+    reference_size: tuple[int, int],
+    dpi: int,
+    persistent: bool = False,
+) -> Image.Image:
+    """Render one top-origin image region while preserving reference coordinates."""
+    x0, y0, x1, y1 = box
+    reference_width, reference_height = reference_size
+    if x1 <= x0 or y1 <= y0 or reference_width <= 0 or reference_height <= 0:
+        raise ValueError("OCR 区域坐标无效。")
+    if pdfium is None:
+        render = render_page_images_persistent if persistent else render_page_images
+        full_image = render(pdf_path, [page_no], dpi=dpi)[0]
+        scale_x = full_image.width / reference_width
+        scale_y = full_image.height / reference_height
+        return full_image.crop((
+            round(x0 * scale_x), round(y0 * scale_y),
+            round(x1 * scale_x), round(y1 * scale_y),
+        )).convert("RGB")
+
+    resolved = pdf_path.resolve()
+    stat = resolved.stat()
+    key = (str(resolved), stat.st_size, stat.st_mtime_ns)
+    document = PDFIUM_DOCUMENTS.get(key) if persistent else None
+    owns_document = document is None
+    if document is None:
+        if persistent:
+            close_pdfium_documents()
+        document = pdfium.PdfDocument(str(resolved))
+        if persistent:
+            PDFIUM_DOCUMENTS[key] = document
+            owns_document = False
+    page = document[page_no - 1]
+    bitmap = None
+    try:
+        page_width, page_height = page.get_width(), page.get_height()
+        crop = (
+            x0 * page_width / reference_width,
+            (reference_height - y1) * page_height / reference_height,
+            (reference_width - x1) * page_width / reference_width,
+            y0 * page_height / reference_height,
+        )
+        bitmap = page.render(scale=dpi / 72.0, crop=crop)
+        return bitmap.to_pil().convert("RGB").copy()
+    finally:
+        if bitmap is not None:
+            bitmap.close()
+        page.close()
+        if owns_document:
+            document.close()
+
+
 def render_page_images(pdf_path: Path, page_numbers: list[int], dpi: int = 140) -> list[Image.Image]:
     if not page_numbers:
         return []
@@ -2281,6 +2336,80 @@ def supplement_missing_vertical_columns(image: Image.Image, items: list[dict], m
             merged = retained + column_items
     merged.sort(key=lambda item: (-float(item.get("cx") or 0), float(item.get("cy") or 0)))
     return merged
+
+
+def supplement_high_resolution_vertical_columns(
+    pdf_path: Path,
+    page_no: int,
+    base_image: Image.Image,
+    items: list[dict],
+    columns: list[dict],
+    dpi: int,
+    persistent: bool = False,
+) -> list[dict]:
+    """Re-render only weak columns and map recognized items to base-image coordinates."""
+    if not columns:
+        return items
+    merged = list(items)
+    for column in columns:
+        column_width = max(1, int(column["x1"] - column["x0"]))
+        x_pad = max(10, round(column_width * .35))
+        y_pad = max(40, round(column_width * 1.5))
+        box = (
+            max(0, int(column["x0"]) - x_pad),
+            max(0, int(column["y0"]) - y_pad),
+            min(base_image.width, int(column["x1"]) + x_pad),
+            min(base_image.height, int(column["y1"]) + y_pad),
+        )
+        region = render_page_region(
+            pdf_path, page_no, box, base_image.size, dpi=dpi, persistent=persistent
+        )
+        box_width, box_height = max(1, box[2] - box[0]), max(1, box[3] - box[1])
+        relative_column = {
+            **column,
+            "x0": round((float(column["x0"]) - box[0]) * region.width / box_width),
+            "x1": round((float(column["x1"]) - box[0]) * region.width / box_width),
+            "y0": round((float(column["y0"]) - box[1]) * region.height / box_height),
+            "y1": round((float(column["y1"]) - box[1]) * region.height / box_height),
+        }
+        relative_column["cx"] = (relative_column["x0"] + relative_column["x1"]) / 2
+        regional_items = supplement_missing_vertical_columns(region, [], [relative_column])
+        mapped_items = []
+        for regional_item in regional_items:
+            points = regional_item.get("box") or []
+            mapped_points = [[
+                box[0] + float(point[0]) * box_width / max(1, region.width),
+                box[1] + float(point[1]) * box_height / max(1, region.height),
+            ] for point in points]
+            bounds = ocr_item_bounds({"box": mapped_points})
+            if bounds is None:
+                continue
+            mapped_items.append({
+                **regional_item,
+                "box": mapped_points,
+                "cx": (bounds[0] + bounds[2]) / 2,
+                "cy": (bounds[1] + bounds[3]) / 2,
+                "origin": f"missing-column-{dpi}dpi",
+            })
+        if mapped_items:
+            tolerance = max(column_width * .7, base_image.width * .012)
+            retained = []
+            for item in merged:
+                bounds = ocr_item_bounds(item)
+                center = (bounds[0] + bounds[2]) / 2 if bounds else float(item.get("cx") or 0)
+                if abs(center - float(column["cx"])) > tolerance:
+                    retained.append(item)
+            merged = retained + mapped_items
+    merged.sort(key=lambda item: (-float(item.get("cx") or 0), float(item.get("cy") or 0)))
+    return merged
+
+
+def needs_high_resolution_page_fallback(image: Image.Image, coverage: dict) -> bool:
+    expected = int(coverage.get("expectedColumns") or 0)
+    problem_count = len(coverage.get("missingColumns") or []) + len(coverage.get("weakColumns") or [])
+    if expected == 0:
+        return image_ink_ratio(image) >= .015
+    return problem_count >= max(4, math.ceil(expected * .4))
 
 
 def ocr_image_payload(image: Image.Image, layout: str, ancient_layout_aware: bool = False) -> dict:
@@ -3108,18 +3237,47 @@ def read_full_ocr_layout(job: dict, page_no: int, layout: str) -> dict | None:
 
 
 def adaptive_full_page_ocr(pdf_path: Path, page_no: int, layout: str, persistent: bool = False) -> dict:
-    """Use a compact first pass and spend extra pixels only on incomplete ancient pages."""
+    """OCR once at base DPI, then spend high-resolution work on weak columns only."""
     render = render_page_images_persistent if persistent else render_page_images
-    attempted_dpis = []
-    payload = {}
-    for dpi in (FULL_OCR_BASE_DPI, *FULL_OCR_RETRY_DPIS):
-        image = render(pdf_path, [page_no], dpi=dpi)[0]
-        payload = ocr_image_payload(image, layout, ancient_layout_aware=True)
-        attempted_dpis.append(dpi)
-        payload["renderDpi"] = dpi
-        payload["attemptedDpis"] = list(attempted_dpis)
-        if not layout.startswith("vertical") or (payload.get("coverage") or {}).get("complete"):
-            break
+    base_image = render(pdf_path, [page_no], dpi=FULL_OCR_BASE_DPI)[0]
+    payload = ocr_image_payload(base_image, layout, ancient_layout_aware=True)
+    attempted_dpis = [FULL_OCR_BASE_DPI]
+    regional_retries = []
+    if layout.startswith("vertical") and not (payload.get("coverage") or {}).get("complete"):
+        items = list(payload.get("items") or [])
+        for dpi in FULL_OCR_RETRY_DPIS:
+            coverage = payload.get("coverage") or {}
+            retry_columns = list(coverage.get("missingColumns") or []) + list(coverage.get("weakColumns") or [])
+            unique_columns = {round(float(column.get("cx") or 0), 1): column for column in retry_columns}
+            if not unique_columns:
+                break
+            items = supplement_high_resolution_vertical_columns(
+                pdf_path, page_no, base_image, items, list(unique_columns.values()),
+                dpi=dpi, persistent=persistent,
+            )
+            attempted_dpis.append(dpi)
+            regional_retries.append({"dpi": dpi, "columns": len(unique_columns)})
+            coverage = evaluate_ocr_coverage(base_image, items, layout)
+            payload.update({
+                "text": clean_ocr_text("\n".join(item["text"] for item in items)),
+                "items": items,
+                "coverage": coverage,
+            })
+            if coverage.get("complete"):
+                break
+
+        coverage = payload.get("coverage") or {}
+        if not coverage.get("complete") and needs_high_resolution_page_fallback(base_image, coverage):
+            fallback_dpi = FULL_OCR_RETRY_DPIS[-1]
+            high_image = render(pdf_path, [page_no], dpi=fallback_dpi)[0]
+            payload = ocr_image_payload(high_image, layout, ancient_layout_aware=True)
+            payload["fullPageFallback"] = True
+            payload["fallbackRenderDpi"] = fallback_dpi
+            if fallback_dpi not in attempted_dpis:
+                attempted_dpis.append(fallback_dpi)
+    payload["renderDpi"] = int(payload.get("fallbackRenderDpi") or FULL_OCR_BASE_DPI)
+    payload["attemptedDpis"] = attempted_dpis
+    payload["regionalRetries"] = regional_retries
     if len(attempted_dpis) > 1:
         payload["adaptiveRetry"] = True
     return payload

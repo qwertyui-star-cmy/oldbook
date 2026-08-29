@@ -415,29 +415,54 @@ class EngineTests(unittest.TestCase):
         self.assertGreater(items[0]["box"][0][1], 0)
         self.assertAlmostEqual(items[0]["cx"], 410, delta=12)
 
-    def test_full_page_ocr_retries_high_dpi_only_when_coverage_is_incomplete(self):
+    def test_full_page_ocr_retries_only_missing_columns_at_high_dpi(self):
         rendered = []
 
         def fake_render(_pdf, _pages, dpi):
             rendered.append(dpi)
             return [Image.new("RGB", (dpi * 4, dpi * 6), "white")]
 
-        payloads = [
-            {"text": "初识", "coverage": {"complete": False}},
-            {"text": "二次识别", "coverage": {"complete": False}},
-            {"text": "完整识别", "coverage": {"complete": True}},
-        ]
+        column = {"x0": 300, "x1": 340, "y0": 100, "y1": 700, "cx": 320}
+        incomplete = {"complete": False, "expectedColumns": 8, "missingColumns": [column], "weakColumns": []}
+        complete = {"complete": True, "expectedColumns": 8, "missingColumns": [], "weakColumns": []}
+        initial = {"text": "初识", "items": [], "coverage": incomplete}
+        regional_items = [[{"text": "二次识别", "cx": 320, "cy": 400, "box": [[300, 100], [340, 100], [340, 700], [300, 700]]}],
+                          [{"text": "完整识别", "cx": 320, "cy": 400, "box": [[300, 100], [340, 100], [340, 700], [300, 700]]}]]
         with (
             patch.object(engine, "render_page_images", side_effect=fake_render),
-            patch.object(engine, "ocr_image_payload", side_effect=payloads),
+            patch.object(engine, "ocr_image_payload", return_value=initial),
+            patch.object(engine, "supplement_high_resolution_vertical_columns", side_effect=regional_items) as regional,
+            patch.object(engine, "evaluate_ocr_coverage", side_effect=[incomplete, complete]),
         ):
             payload = engine.adaptive_full_page_ocr(Path("book.pdf"), 1, "vertical-single")
 
-        self.assertEqual(rendered, [engine.FULL_OCR_BASE_DPI, *engine.FULL_OCR_RETRY_DPIS])
+        self.assertEqual(rendered, [engine.FULL_OCR_BASE_DPI])
+        self.assertEqual([call.kwargs["dpi"] for call in regional.call_args_list], list(engine.FULL_OCR_RETRY_DPIS))
         self.assertEqual(payload["text"], "完整识别")
-        self.assertEqual(payload["renderDpi"], engine.FULL_OCR_RETRY_DPIS[-1])
+        self.assertEqual(payload["renderDpi"], engine.FULL_OCR_BASE_DPI)
         self.assertEqual(payload["attemptedDpis"], [engine.FULL_OCR_BASE_DPI, *engine.FULL_OCR_RETRY_DPIS])
         self.assertTrue(payload["adaptiveRetry"])
+
+    def test_high_resolution_column_items_map_back_to_base_page(self):
+        base = Image.new("RGB", (1000, 1400), "white")
+        column = {"x0": 390, "x1": 430, "y0": 200, "y1": 1200, "cx": 410}
+        regional_item = {
+            "text": "補識別", "box": [[20, 30], [80, 30], [80, 970], [20, 970]],
+            "cx": 50, "cy": 500, "score": .9,
+        }
+        with (
+            patch.object(engine, "render_page_region", return_value=Image.new("RGB", (100, 1000), "white")),
+            patch.object(engine, "supplement_missing_vertical_columns", return_value=[regional_item]),
+        ):
+            items = engine.supplement_high_resolution_vertical_columns(
+                Path("book.pdf"), 1, base, [], [column], dpi=230
+            )
+
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["origin"], "missing-column-230dpi")
+        self.assertAlmostEqual(items[0]["cx"], 410, delta=25)
+        self.assertGreater(items[0]["cy"], column["y0"])
+        self.assertLess(items[0]["cy"], column["y1"])
 
     def test_full_page_ocr_keeps_base_dpi_when_coverage_is_complete(self):
         with (
