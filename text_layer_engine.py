@@ -3226,6 +3226,12 @@ def full_ocr_layout_path(job: dict, page_no: int, layout: str) -> Path:
     return job_paths(job_id).root / cache_name if job_id else Path(job["pdf"]).parent / cache_name
 
 
+def full_ocr_base_path(job: dict, page_no: int, layout: str) -> Path:
+    job_id = str(job.get("id") or "").strip()
+    cache_name = f"page-{page_no:04d}-ocr-base-v1-{layout}.json"
+    return job_paths(job_id).root / cache_name if job_id else Path(job["pdf"]).parent / cache_name
+
+
 def full_ocr_cache_ready(job: dict, page_no: int, layout: str) -> bool:
     return full_ocr_cache_path(job, page_no, layout).is_file() and full_ocr_layout_path(job, page_no, layout).is_file()
 
@@ -3243,11 +3249,17 @@ def read_full_ocr_layout(job: dict, page_no: int, layout: str) -> dict | None:
     return None
 
 
-def adaptive_full_page_ocr(pdf_path: Path, page_no: int, layout: str, persistent: bool = False) -> dict:
+def adaptive_full_page_ocr(
+    pdf_path: Path,
+    page_no: int,
+    layout: str,
+    persistent: bool = False,
+    base_payload: dict | None = None,
+) -> dict:
     """OCR once at base DPI, then spend high-resolution work on weak columns only."""
     render = render_page_images_persistent if persistent else render_page_images
     base_image = render(pdf_path, [page_no], dpi=FULL_OCR_BASE_DPI)[0]
-    payload = ocr_image_payload(base_image, layout, ancient_layout_aware=True)
+    payload = dict(base_payload) if base_payload is not None else ocr_image_payload(base_image, layout, ancient_layout_aware=True)
     attempted_dpis = [FULL_OCR_BASE_DPI]
     regional_retries = []
     if layout.startswith("vertical") and not (payload.get("coverage") or {}).get("complete"):
@@ -3297,13 +3309,51 @@ def full_page_ocr_worker(payload: tuple[str, int, str]) -> tuple[int, str, str]:
         cache_path = full_ocr_cache_path(job, page_no, layout)
         if full_ocr_cache_ready(job, page_no, layout):
             return page_no, ocr_page_text(job, page_no, layout, anchors_only=False), ""
-        ocr_payload = adaptive_full_page_ocr(Path(job["pdf"]), page_no, layout, persistent=True)
+        base_path = full_ocr_base_path(job, page_no, layout)
+        base_payload = None
+        if base_path.is_file():
+            try:
+                base_payload = json.loads(base_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                base_payload = None
+        ocr_payload = adaptive_full_page_ocr(
+            Path(job["pdf"]), page_no, layout, persistent=True, base_payload=base_payload,
+        )
         text = str(ocr_payload.get("text") or "")
         atomic_write_text(cache_path, text)
         atomic_write_json(full_ocr_layout_path(job, page_no, layout), ocr_payload)
+        base_path.unlink(missing_ok=True)
         return page_no, text, ""
     except Exception as error:
         return page_no, "", str(error)
+
+
+def base_full_page_ocr_worker(payload: tuple[str, int, str]) -> tuple[int, bool, str, str]:
+    """Run only the common 150 DPI pass; defer weak pages to the retry queue."""
+    job_id, page_no, layout = payload
+    try:
+        job = json.loads(job_paths(job_id).meta.read_text(encoding="utf-8"))
+        if full_ocr_cache_ready(job, page_no, layout):
+            return page_no, True, ocr_page_text(job, page_no, layout, anchors_only=False), ""
+        base_path = full_ocr_base_path(job, page_no, layout)
+        if base_path.is_file():
+            base_payload = json.loads(base_path.read_text(encoding="utf-8"))
+        else:
+            image = render_page_images_persistent(Path(job["pdf"]), [page_no], dpi=FULL_OCR_BASE_DPI)[0]
+            base_payload = ocr_image_payload(image, layout, ancient_layout_aware=True)
+            base_payload["renderDpi"] = FULL_OCR_BASE_DPI
+            base_payload["attemptedDpis"] = [FULL_OCR_BASE_DPI]
+            base_payload["regionalRetries"] = []
+            atomic_write_json(base_path, base_payload)
+        complete = bool((base_payload.get("coverage") or {}).get("complete")) or not layout.startswith("vertical")
+        text = str(base_payload.get("text") or "")
+        if complete:
+            atomic_write_text(full_ocr_cache_path(job, page_no, layout), text)
+            atomic_write_json(full_ocr_layout_path(job, page_no, layout), base_payload)
+            base_path.unlink(missing_ok=True)
+        return page_no, complete, text, ""
+    except Exception as error:
+        return page_no, False, "", str(error)
 
 
 def page_anchor_text(job: dict, reader: PdfReader, page_no: int, layout: str) -> str:
@@ -4297,38 +4347,80 @@ def fill_non_authoritative_ocr(
         with concurrent.futures.ProcessPoolExecutor(max_workers=worker_capacity) as pool:
             page_queue = iter(pending_pages)
             pending: dict[concurrent.futures.Future, int] = {}
+            complex_pages = []
+            base_scanned = 0
 
-            def fill_queue() -> None:
+            def fill_queue(worker: Callable, queue, phase: str) -> None:
                 nonlocal current_worker_limit
                 current_worker_limit = adaptive_ocr_workers(worker_capacity)
                 while len(pending) < current_worker_limit:
                     try:
-                        page_no = next(page_queue)
+                        page_no = next(queue)
                     except StopIteration:
                         break
-                    pending[pool.submit(full_page_ocr_worker, (str(job.get("id") or ""), page_no, layout))] = page_no
+                    pending[pool.submit(worker, (str(job.get("id") or ""), page_no, layout))] = page_no
                 if status_job_id:
                     active_pages = sorted(pending.values())
                     active_workers = len(pending)
                     update_pipeline_stage(
                         status_job_id, "classify", "running", state="planning",
                         processed=completed, total=len(candidates),
-                        detail=f"非权威页整页 OCR {completed} / {len(candidates)}",
+                        detail=(
+                            f"普通页优先队列：150 DPI 已扫描 {base_scanned} / {len(pending_pages)}"
+                            if phase == "base" else
+                            f"复杂页补识别队列：已完成 {completed} / {len(candidates)}"
+                        ),
                         metrics=throughput_metrics(
                             started, completed, len(candidates), workers=active_workers,
                             currentWorkers=active_workers, maxWorkers=worker_capacity,
-                            activePages=active_pages,
+                            activePages=active_pages, queuePhase=phase,
                         ),
                     )
 
-            fill_queue()
+            fill_queue(base_full_page_ocr_worker, page_queue, "base")
+            while pending:
+                done, _ = concurrent.futures.wait(tuple(pending), return_when=concurrent.futures.FIRST_COMPLETED)
+                for future in done:
+                    expected_page = pending.pop(future)
+                    page_no, complete_at_base, text, error = future.result()
+                    if error:
+                        raise RuntimeError(f"第 {expected_page} 页 150 DPI OCR 失败：{error}")
+                    base_scanned += 1
+                    if complete_at_base:
+                        apply_text(page_no, text)
+                    else:
+                        complex_pages.append(page_no)
+                if status_job_id and read_full_status(status_job_id).get("pauseRequested"):
+                    for future in pending:
+                        future.cancel()
+                    update_pipeline_stage(
+                        status_job_id, "classify", "paused", state="paused",
+                        processed=completed, total=len(candidates), detail="已完成 OCR 和缓存均已保留",
+                        pauseRequested=False,
+                    )
+                    raise TaskPaused()
+                fill_queue(base_full_page_ocr_worker, page_queue, "base")
+
+            retry_queue = iter(sorted(complex_pages))
+            if status_job_id and complex_pages:
+                update_pipeline_stage(
+                    status_job_id, "classify", "running", state="planning",
+                    processed=completed, total=len(candidates),
+                    detail=f"普通页已完成；复杂页补识别队列 {len(complex_pages)} 页",
+                    metrics=throughput_metrics(
+                        started, completed, len(candidates), workers=0,
+                        currentWorkers=0, maxWorkers=worker_capacity,
+                        activePages=[], queuePhase="retry", complexPages=len(complex_pages),
+                    ),
+                )
+            fill_queue(full_page_ocr_worker, retry_queue, "retry")
             while pending:
                 done, _ = concurrent.futures.wait(tuple(pending), return_when=concurrent.futures.FIRST_COMPLETED)
                 for future in done:
                     expected_page = pending.pop(future)
                     page_no, text, error = future.result()
                     if error:
-                        raise RuntimeError(f"第 {expected_page} 页整页 OCR 失败：{error}")
+                        raise RuntimeError(f"第 {expected_page} 页复杂页补识别失败：{error}")
                     apply_text(page_no, text)
                 if status_job_id and read_full_status(status_job_id).get("pauseRequested"):
                     for future in pending:
@@ -4339,7 +4431,7 @@ def fill_non_authoritative_ocr(
                         pauseRequested=False,
                     )
                     raise TaskPaused()
-                fill_queue()
+                fill_queue(full_page_ocr_worker, retry_queue, "retry")
     if status_job_id:
         update_pipeline_stage(
             status_job_id, "classify", "done", state="planning",
@@ -4453,6 +4545,14 @@ def build_strict_page_manifest(
         if commit_callback:
             commit_callback(page_no, dict(row))
 
+    if status_job_id:
+        checkpoint_path = job_paths(status_job_id).root / "authoritative-boundary-checkpoint.json"
+        atomic_write_json(checkpoint_path, {
+            "engineVersion": LAYOUT_ENGINE_VERSION,
+            "inputFingerprint": job.get("inputFingerprint", ""),
+            "layout": layout,
+            "pages": manifest,
+        })
     fill_non_authoritative_ocr(job, reader, manifest, layout, status_job_id)
     if status_job_id:
         body_count = sum(1 for item in manifest if item.get("kind") == "body")
@@ -5672,6 +5772,7 @@ def build_full_pdf(job_id: str, layout: str, stop_after: int | None = None) -> d
     stale_pdf = paths.root / ".text-positioned-full.stale.pdf"
     building_pdf = paths.root / ".text-positioned-full.building.pdf"
     manifest_path = paths.root / "page-text-manifest.json"
+    boundary_checkpoint_path = paths.root / "authoritative-boundary-checkpoint.json"
     if final_pdf.exists():
         stale_pdf.unlink(missing_ok=True)
         os.replace(final_pdf, stale_pdf)
@@ -5741,6 +5842,27 @@ def build_full_pdf(job_id: str, layout: str, stop_after: int | None = None) -> d
                 manifest = cached_pages
                 manifest_reused = True
         except (OSError, json.JSONDecodeError):
+            pass
+    if manifest is None:
+        try:
+            checkpoint = json.loads(boundary_checkpoint_path.read_text(encoding="utf-8"))
+            checkpoint_pages = checkpoint.get("pages") if isinstance(checkpoint, dict) else None
+            if (
+                isinstance(checkpoint_pages, list)
+                and len(checkpoint_pages) == page_count
+                and checkpoint.get("engineVersion") == LAYOUT_ENGINE_VERSION
+                and checkpoint.get("layout") == selected_layout
+                and checkpoint.get("inputFingerprint") == job.get("inputFingerprint")
+            ):
+                manifest = checkpoint_pages
+                update_pipeline_stage(
+                    job_id, "align", "done", state="planning",
+                    processed=page_count, total=page_count,
+                    detail="已恢复权威正文边界检查点，无需重新定位",
+                    metrics={"boundaryCheckpointReused": True},
+                )
+                fill_non_authoritative_ocr(job, reader, manifest, selected_layout, job_id)
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
             pass
     if manifest is None:
         # There is only one production alignment path. Estimated/fast manifests

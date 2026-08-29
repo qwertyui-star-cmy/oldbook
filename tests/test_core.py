@@ -492,6 +492,24 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(payload["attemptedDpis"], [engine.FULL_OCR_BASE_DPI])
         self.assertNotIn("adaptiveRetry", payload)
 
+    def test_complex_retry_reuses_saved_base_ocr(self):
+        base_payload = {
+            "text": "基础识别",
+            "items": [],
+            "coverage": {"complete": False, "expectedColumns": 1, "missingColumns": [], "weakColumns": []},
+        }
+        with (
+            patch.object(engine, "render_page_images", return_value=[Image.new("RGB", (600, 900), "white")]),
+            patch.object(engine, "ocr_image_payload") as base_ocr,
+        ):
+            payload = engine.adaptive_full_page_ocr(
+                Path("book.pdf"), 1, "vertical-single", base_payload=base_payload,
+            )
+
+        base_ocr.assert_not_called()
+        self.assertEqual(payload["text"], "基础识别")
+        self.assertEqual(payload["attemptedDpis"], [engine.FULL_OCR_BASE_DPI])
+
     def test_word_style_frame_reduces_font_instead_of_overflowing(self):
         usable_w = 595 - 2 * (3 * 72 / 2.54)
         usable_h = 842 - 2 * (3 * 72 / 2.54)
