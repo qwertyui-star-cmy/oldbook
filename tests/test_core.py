@@ -426,6 +426,50 @@ class EngineTests(unittest.TestCase):
         self.assertTrue(updated["complete"])
         self.assertEqual(updated["weakColumns"], [])
 
+    def test_editorial_decoration_does_not_inflate_expected_character_count(self):
+        column = {
+            "x0": 360, "x1": 400, "y0": 100, "y1": 1000, "cx": 380,
+            "estimatedTextChars": 30, "inkGlyphRuns": 30,
+            "shortInkRunRatio": .533, "dottedLeader": False,
+        }
+        coverage = {
+            "complete": False, "expectedColumns": 1, "missingColumns": [],
+            "weakColumns": [column], "imageWidth": 800,
+        }
+        items = [{
+            "text": "晋诸公赞又作", "box": [[360, 100], [400, 100], [400, 500], [360, 500]],
+        }]
+
+        updated = engine.reevaluate_saved_ocr_coverage(coverage, items)
+
+        self.assertTrue(updated["complete"])
+
+    def test_stable_weak_column_release_keeps_real_missing_columns_blocked(self):
+        weak = {"cx": 380, "x0": 360, "x1": 400, "y0": 100, "y1": 900}
+        missing = {"cx": 280, "x0": 260, "x1": 300, "y0": 100, "y1": 900}
+        coverage = {
+            "complete": False, "expectedColumns": 2, "coveredColumns": 1,
+            "missingColumns": [missing], "weakColumns": [weak],
+        }
+
+        updated = engine.release_stable_weak_columns(coverage, {380.0})
+
+        self.assertFalse(updated["complete"])
+        self.assertEqual(updated["weakColumns"], [])
+        self.assertEqual(updated["missingColumns"], [missing])
+
+    def test_column_signature_uses_positioned_items_in_reading_order(self):
+        column = {"cx": 380, "x0": 360, "x1": 400, "y0": 100, "y1": 900}
+        items = [
+            {"text": "下段", "box": [[360, 500], [400, 500], [400, 700], [360, 700]]},
+            {"text": "上段", "box": [[360, 120], [400, 120], [400, 320], [360, 320]]},
+            {"text": "邻列", "box": [[500, 120], [540, 120], [540, 320], [500, 320]]},
+        ]
+
+        signature = engine.ocr_column_signature(column, items, 800)
+
+        self.assertEqual(signature, "上段下段")
+
     def test_ancient_vertical_coverage_does_not_count_toc_dots_as_missing_words(self):
         image = Image.new("L", (700, 1400), "white")
         draw = ImageDraw.Draw(image)

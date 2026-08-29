@@ -2224,6 +2224,7 @@ def detect_ancient_vertical_columns(image: Image.Image) -> list[dict]:
             / max(1, len(glyph_runs))
         )
         dotted_leader = len(glyph_runs) >= 12 and short_run_ratio >= .65
+        decoration_heavy = len(glyph_runs) >= 12 and short_run_ratio >= .50
         estimated_text_chars = min(
             len(glyph_runs),
             max(1, round((bottom - top) / max(1.0, run_width * 1.15))),
@@ -2234,6 +2235,7 @@ def detect_ancient_vertical_columns(image: Image.Image) -> list[dict]:
             "inkGlyphRuns": len(glyph_runs),
             "estimatedTextChars": estimated_text_chars,
             "dottedLeader": dotted_leader,
+            "decorationHeavy": decoration_heavy,
             "shortInkRunRatio": round(short_run_ratio, 3),
         })
     return columns
@@ -2263,7 +2265,7 @@ def evaluate_ocr_coverage(image: Image.Image, items: list[dict], layout: str) ->
             column["recognizedChars"] = recognized_chars
             # Traditional glyphs often split into two projected ink runs. Treat the
             # estimate as a missing-text signal only when recognition is below half.
-            if not column.get("dottedLeader") and expected_chars >= 6 and recognized_chars < expected_chars * .48:
+            if not column_has_nontext_decoration(column) and expected_chars >= 6 and recognized_chars < expected_chars * .48:
                 weak.append(column)
         else:
             missing.append(column)
@@ -2308,7 +2310,7 @@ def reevaluate_saved_ocr_coverage(coverage: dict, items: list[dict]) -> dict:
         recognized_chars = sum(len(canonical_output_text(str(item.get("text") or ""))) for item in matched)
         expected_chars = int(column.get("estimatedTextChars") or 0)
         updated = {**column, "recognizedChars": recognized_chars}
-        if not column.get("dottedLeader") and expected_chars >= 6 and recognized_chars < expected_chars * .48:
+        if not column_has_nontext_decoration(column) and expected_chars >= 6 and recognized_chars < expected_chars * .48:
             weak.append(updated)
     expected = int(coverage.get("expectedColumns") or 0)
     covered = expected - len(missing)
@@ -2321,6 +2323,52 @@ def reevaluate_saved_ocr_coverage(coverage: dict, items: list[dict]) -> dict:
         "coveragePercent": round(100 * usable / max(1, expected), 1),
         "missingColumns": missing,
         "weakColumns": weak,
+    }
+
+
+def column_has_nontext_decoration(column: dict) -> bool:
+    return bool(
+        column.get("dottedLeader")
+        or column.get("decorationHeavy")
+        or (
+            int(column.get("inkGlyphRuns") or 0) >= 12
+            and float(column.get("shortInkRunRatio") or 0) >= .50
+        )
+    )
+
+
+def ocr_column_signature(column: dict, items: list[dict], image_width: int) -> str:
+    """Return positioned OCR text belonging to one detected vertical column."""
+    col_width = max(1.0, float(column["x1"] - column["x0"]))
+    tolerance = max(col_width * .7, image_width * .012)
+    matched = []
+    for item in items:
+        bounds = ocr_item_bounds(item)
+        if bounds is None:
+            continue
+        x0, y0, x1, y1 = bounds
+        center = (x0 + x1) / 2
+        vertical_overlap = max(0.0, min(y1, column["y1"]) - max(y0, column["y0"]))
+        if abs(center - column["cx"]) <= tolerance and vertical_overlap >= min(y1 - y0, column["y1"] - column["y0"]) * .18:
+            matched.append((y0, canonical_output_text(str(item.get("text") or ""))))
+    return "".join(text for _, text in sorted(matched) if text)
+
+
+def release_stable_weak_columns(coverage: dict, stable_centers: set[float]) -> dict:
+    weak = [
+        column for column in coverage.get("weakColumns") or []
+        if round(float(column.get("cx") or 0), 1) not in stable_centers
+    ]
+    missing = list(coverage.get("missingColumns") or [])
+    expected = int(coverage.get("expectedColumns") or 0)
+    usable = expected - len(missing) - len(weak)
+    return {
+        **coverage,
+        "complete": not missing and not weak,
+        "usableColumns": usable,
+        "coveragePercent": round(100 * usable / max(1, expected), 1),
+        "weakColumns": weak,
+        "stableWeakColumns": sorted(stable_centers),
     }
 
 
@@ -3378,9 +3426,14 @@ def adaptive_full_page_ocr(
     reference_size = tuple(payload.get("imageSize") or (base_image.size if base_image is not None else (0, 0)))
     attempted_dpis = [FULL_OCR_BASE_DPI]
     regional_retries = []
+    signature_history: dict[float, str] = {}
+    stable_weak_centers: set[float] = set()
     if layout.startswith("vertical") and not (payload.get("coverage") or {}).get("complete"):
         items = list(payload.get("items") or [])
-        for dpi in FULL_OCR_RETRY_DPIS:
+        column_retry_dpis = [*FULL_OCR_RETRY_DPIS]
+        if STUBBORN_FULL_OCR_DPI not in column_retry_dpis:
+            column_retry_dpis.append(STUBBORN_FULL_OCR_DPI)
+        for dpi in column_retry_dpis:
             coverage = payload.get("coverage") or {}
             retry_columns = list(coverage.get("missingColumns") or []) + list(coverage.get("weakColumns") or [])
             unique_columns = {round(float(column.get("cx") or 0), 1): column for column in retry_columns}
@@ -3391,11 +3444,28 @@ def adaptive_full_page_ocr(
                 dpi=dpi, persistent=persistent,
             )
             attempted_dpis.append(dpi)
-            regional_retries.append({"dpi": dpi, "columns": len(unique_columns)})
             coverage = (
                 evaluate_ocr_coverage(base_image, items, layout)
                 if base_image is not None else reevaluate_saved_ocr_coverage(coverage, items)
             )
+            current_signatures = {}
+            weak_centers = {
+                round(float(value.get("cx") or 0), 1)
+                for value in coverage.get("weakColumns") or []
+            }
+            for center, column in unique_columns.items():
+                signature = ocr_column_signature(column, items, int(reference_size[0]))
+                current_signatures[center] = signature
+                if signature and signature_history.get(center) == signature and center in weak_centers:
+                    stable_weak_centers.add(center)
+                signature_history[center] = signature
+            if stable_weak_centers:
+                coverage = release_stable_weak_columns(coverage, stable_weak_centers)
+            regional_retries.append({
+                "dpi": dpi, "columns": len(unique_columns),
+                "stableColumns": len(stable_weak_centers),
+                "signatures": current_signatures,
+            })
             payload.update({
                 "text": clean_ocr_text("\n".join(item["text"] for item in items)),
                 "items": items,
@@ -3417,7 +3487,7 @@ def adaptive_full_page_ocr(
             )
         )
         if not coverage.get("complete") and fallback_needed:
-            fallback_dpi = FULL_OCR_RETRY_DPIS[-1]
+            fallback_dpi = STUBBORN_FULL_OCR_DPI
             high_image = render(pdf_path, [page_no], dpi=fallback_dpi)[0]
             payload = ocr_image_payload(high_image, layout, ancient_layout_aware=True)
             payload["fullPageFallback"] = True
@@ -3449,25 +3519,12 @@ def full_page_ocr_worker(payload: tuple[str, int, str]) -> tuple[int, str, str]:
             or not ocr_geometry_matches_text(existing_payload, existing_text)
         )
         if existing_needs_retry:
-            high_image = render_page_images_persistent(
-                Path(job["pdf"]), [page_no], dpi=STUBBORN_FULL_OCR_DPI,
-            )[0]
-            high_payload = ocr_image_payload(high_image, layout, ancient_layout_aware=True)
-            previous_percent = float(existing_coverage.get("coveragePercent") or 0)
-            high_percent = float((high_payload.get("coverage") or {}).get("coveragePercent") or 0)
-            high_geometry_ready = ocr_geometry_matches_text(high_payload, str(high_payload.get("text") or ""))
-            ocr_payload = (
-                high_payload
-                if high_geometry_ready and (high_percent >= previous_percent or not ocr_geometry_matches_text(existing_payload, existing_text))
-                else existing_payload
+            # Recheck only unresolved columns first. Two stable high-resolution
+            # column results are stronger evidence than another whole-page render.
+            ocr_payload = adaptive_full_page_ocr(
+                Path(job["pdf"]), page_no, layout, persistent=True,
+                base_payload=existing_payload,
             )
-            attempted = list(existing_payload.get("attemptedDpis") or [])
-            if STUBBORN_FULL_OCR_DPI not in attempted:
-                attempted.append(STUBBORN_FULL_OCR_DPI)
-            ocr_payload["attemptedDpis"] = attempted
-            ocr_payload["stubbornFullPageRetry"] = True
-            ocr_payload["fallbackRenderDpi"] = STUBBORN_FULL_OCR_DPI
-            ocr_payload["renderDpi"] = STUBBORN_FULL_OCR_DPI
             text = str(ocr_payload.get("text") or "")
             atomic_write_text(cache_path, text)
             atomic_write_json(full_ocr_layout_path(job, page_no, layout), ocr_payload)
