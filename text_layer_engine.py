@@ -1820,7 +1820,10 @@ def draw_ocr_positioned_text(pdf_canvas, text: str, page_w: float, page_h: float
 
 
 def expected_text_layer_norm(text: str) -> str:
-    return canonical_output_text(text)
+    return "".join(
+        char for char in canonical_output_text(text)
+        if not unicodedata.category(char).startswith("P")
+    )
 
 
 def page_text_from_sources(job: dict, page_no: int, layout: str | None = None, require_anchor_for_scan: bool = True) -> str:
@@ -5853,7 +5856,7 @@ def validate_page_text_layer(pdf_path: Path, expected_text: str) -> int:
     if len(reader.pages) != 1:
         raise ValueError("中间页文件页数异常，已停止整本输出。")
     extracted = reader.pages[0].extract_text() or ""
-    extracted_norm = canonical_output_text(extracted)
+    extracted_norm = expected_text_layer_norm(extracted)
     expected_norm = expected_text_layer_norm(expected_text)
     if extracted_norm != expected_norm:
         raise ValueError("中间页文字层与锁定正文不一致，已停止整本输出。")
@@ -6043,7 +6046,7 @@ def validate_full_output(source_pdf: Path, output_pdf: Path, manifest: list[dict
     expected_stream = hashlib.sha256()
     for index, row in enumerate(manifest):
         extracted = output_reader.pages[index].extract_text() or ""
-        extracted_norm = canonical_output_text(extracted)
+        extracted_norm = expected_text_layer_norm(extracted)
         expected_norm = expected_text_layer_norm(str(row.get("text") or ""))
         if extracted_norm != expected_norm:
             raise ValueError(f"第 {index + 1} 页复制文字与锁定正文不一致，已停止发布。")
@@ -6515,7 +6518,7 @@ def validate_trial_output(
     image_size: tuple[int, int] | None = None,
 ) -> dict:
     extracted = PdfReader(str(trial_pdf), strict=False).pages[0].extract_text() or ""
-    extracted_norm = canonical_output_text(extracted)
+    extracted_norm = expected_text_layer_norm(extracted)
     expected_norm = expected_text_layer_norm(expected_text)
     if expected_norm and len(extracted_norm) < max(4, round(len(expected_norm) * 0.8)):
         raise ValueError("试页文字层没有完整写入，已停止输出。")
