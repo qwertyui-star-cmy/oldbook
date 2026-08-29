@@ -538,6 +538,24 @@ class EngineTests(unittest.TestCase):
                 engine.cached_page_classification(job, 3, "vertical-single", "变化后的文字"),
             )
 
+    def test_incomplete_ocr_cache_is_retried_unless_page_is_blank(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            job = {"pdf": str(Path(temporary) / "book.pdf"), "inputFingerprint": "input-1"}
+            text = "残缺识别"
+            engine.atomic_write_text(engine.full_ocr_cache_path(job, 2, "vertical-single"), text)
+            engine.atomic_write_json(engine.full_ocr_layout_path(job, 2, "vertical-single"), {
+                "text": text,
+                "items": [],
+                "imageSize": [600, 900],
+                "coverage": {"complete": False, "missingColumns": [{"cx": 300}]},
+            })
+
+            self.assertFalse(engine.full_ocr_cache_ready(job, 2, "vertical-single"))
+            engine.save_page_classification(
+                job, 2, "vertical-single", text, {"kind": "blank", "reason": "空白页"},
+            )
+            self.assertTrue(engine.full_ocr_cache_ready(job, 2, "vertical-single"))
+
     def test_word_style_frame_reduces_font_instead_of_overflowing(self):
         usable_w = 595 - 2 * (3 * 72 / 2.54)
         usable_h = 842 - 2 * (3 * 72 / 2.54)

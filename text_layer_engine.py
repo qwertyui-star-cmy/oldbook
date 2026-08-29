@@ -100,6 +100,7 @@ ANCHOR_BASE_DPI = 150
 ANCHOR_RETRY_DPI = 180
 FULL_OCR_BASE_DPI = 150
 FULL_OCR_RETRY_DPIS = (190, 230)
+STUBBORN_FULL_OCR_DPI = 300
 MIN_COLUMN_OCR_WIDTH = 64
 MAX_COLUMN_OCR_SCALE = 2.0
 TEXT_FONT_CANDIDATES = [
@@ -3314,7 +3315,19 @@ def save_page_classification(job: dict, page_no: int, layout: str, text: str, de
 
 
 def full_ocr_cache_ready(job: dict, page_no: int, layout: str) -> bool:
-    return full_ocr_cache_path(job, page_no, layout).is_file() and full_ocr_layout_path(job, page_no, layout).is_file()
+    text_path = full_ocr_cache_path(job, page_no, layout)
+    if not job.get("id") and not job.get("pdf"):
+        return text_path.is_file()
+    layout_path = full_ocr_layout_path(job, page_no, layout)
+    if not text_path.is_file() or not layout_path.is_file():
+        return False
+    geometry = read_full_ocr_layout(job, page_no, layout) or {}
+    coverage = geometry.get("coverage") or {}
+    if not coverage or coverage.get("complete", False):
+        return True
+    text = text_path.read_text(encoding="utf-8", errors="ignore")
+    decision = cached_page_classification(job, page_no, layout, text)
+    return bool(decision and decision.get("kind") == "blank")
 
 
 def read_full_ocr_layout(job: dict, page_no: int, layout: str) -> dict | None:
@@ -3407,6 +3420,28 @@ def full_page_ocr_worker(payload: tuple[str, int, str]) -> tuple[int, str, str]:
             return page_no, ocr_page_text(job, page_no, layout, anchors_only=False), ""
         base_path = full_ocr_base_path(job, page_no, layout)
         base_payload = None
+        existing_payload = read_full_ocr_layout(job, page_no, layout)
+        existing_coverage = (existing_payload or {}).get("coverage") or {}
+        if existing_payload and existing_coverage and not existing_coverage.get("complete", False):
+            high_image = render_page_images_persistent(
+                Path(job["pdf"]), [page_no], dpi=STUBBORN_FULL_OCR_DPI,
+            )[0]
+            high_payload = ocr_image_payload(high_image, layout, ancient_layout_aware=True)
+            previous_percent = float(existing_coverage.get("coveragePercent") or 0)
+            high_percent = float((high_payload.get("coverage") or {}).get("coveragePercent") or 0)
+            ocr_payload = high_payload if high_percent >= previous_percent else existing_payload
+            attempted = list(existing_payload.get("attemptedDpis") or [])
+            if STUBBORN_FULL_OCR_DPI not in attempted:
+                attempted.append(STUBBORN_FULL_OCR_DPI)
+            ocr_payload["attemptedDpis"] = attempted
+            ocr_payload["stubbornFullPageRetry"] = True
+            ocr_payload["fallbackRenderDpi"] = STUBBORN_FULL_OCR_DPI
+            ocr_payload["renderDpi"] = STUBBORN_FULL_OCR_DPI
+            text = str(ocr_payload.get("text") or "")
+            atomic_write_text(cache_path, text)
+            atomic_write_json(full_ocr_layout_path(job, page_no, layout), ocr_payload)
+            base_path.unlink(missing_ok=True)
+            return page_no, text, ""
         if base_path.is_file():
             try:
                 base_payload = json.loads(base_path.read_text(encoding="utf-8"))
@@ -3431,6 +3466,11 @@ def base_full_page_ocr_worker(payload: tuple[str, int, str]) -> tuple[int, bool,
         job = json.loads(job_paths(job_id).meta.read_text(encoding="utf-8"))
         if full_ocr_cache_ready(job, page_no, layout):
             return page_no, True, ocr_page_text(job, page_no, layout, anchors_only=False), ""
+        existing_payload = read_full_ocr_layout(job, page_no, layout)
+        existing_coverage = (existing_payload or {}).get("coverage") or {}
+        if existing_payload and existing_coverage and not existing_coverage.get("complete", False):
+            text = full_ocr_cache_path(job, page_no, layout).read_text(encoding="utf-8", errors="ignore")
+            return page_no, False, text, ""
         base_path = full_ocr_base_path(job, page_no, layout)
         if base_path.is_file():
             base_payload = json.loads(base_path.read_text(encoding="utf-8"))
