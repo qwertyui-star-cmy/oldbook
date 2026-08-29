@@ -114,6 +114,10 @@ EXTB_TEXT_FONT_CANDIDATES = [
     Path(r"C:\Windows\Fonts\simsunb.ttf"),
     Path(r"C:\Windows\Fonts\SimsunExtG.ttf"),
 ]
+RARE_TEXT_FONT_CANDIDATES = [
+    ROOT / "assets" / "fonts" / "BabelStoneHan.ttf",
+    *TEXT_FONT_CANDIDATES[1:],
+]
 OCR_ENGINE = None
 OPENCC_CONVERTER = None
 STATUS_LOCKS: dict[str, threading.RLock] = {}
@@ -1404,7 +1408,7 @@ def ensure_char_font(char: str) -> str:
     if ord(char) in getattr(getattr(primary_font, "face", None), "charToGlyph", {}):
         return primary
     if not FALLBACK_TEXT_FONT_REGISTERED:
-        for font_path in TEXT_FONT_CANDIDATES[1:]:
+        for font_path in RARE_TEXT_FONT_CANDIDATES:
             if not font_path.exists():
                 continue
             try:

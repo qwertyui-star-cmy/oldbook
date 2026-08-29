@@ -16,6 +16,7 @@ from PIL import Image, ImageDraw
 from pypdf import PdfReader, PdfWriter
 from pypdf.generic import ContentStream
 from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
 
 import server
 import text_layer_engine as engine
@@ -30,6 +31,13 @@ class EngineTests(unittest.TestCase):
         font_name = engine.ensure_char_font("䂮")
         font = pdfmetrics.getFont(font_name)
         self.assertIn(ord("䂮"), font.face.charToGlyph)
+
+    def test_bundled_rare_character_font_covers_bmp_and_supplementary_han(self):
+        font_path = engine.ROOT / "assets" / "fonts" / "BabelStoneHan.ttf"
+        self.assertTrue(font_path.is_file())
+        font = TTFont("BundledRareHanTest", str(font_path))
+        self.assertIn(ord("䂮"), font.face.charToGlyph)
+        self.assertIn(ord("𠀀"), font.face.charToGlyph)
 
     def test_job_id_cannot_escape_cache_root(self):
         with self.assertRaises(ValueError):
