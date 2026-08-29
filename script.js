@@ -21,6 +21,7 @@
   const runFull = document.getElementById("runFull");
   const pauseFull = document.getElementById("pauseFull");
   const pauseProgress = document.getElementById("pauseProgress");
+  const refreshProgress = document.getElementById("refreshProgress");
   const activateProgress = document.getElementById("activateProgress");
   const cleanupJob = document.getElementById("cleanupJob");
   const reviewDraft = document.getElementById("reviewDraft");
@@ -51,6 +52,7 @@
   let activeSource = "file";
   let currentJob = null;
   let pollTimer = null;
+  let pollGeneration = 0;
   let latestFullStatus = null;
   let serviceCapabilities = {};
   let progressSamples = [];
@@ -143,8 +145,21 @@
     `;
   }
 
-  async function api(path, options) {
-    const response = await fetch(path, options);
+  async function api(path, options = {}) {
+    const { timeoutMs = 0, ...fetchOptions } = options;
+    const controller = timeoutMs ? new AbortController() : null;
+    const timeout = controller
+      ? window.setTimeout(() => controller.abort(), timeoutMs)
+      : null;
+    let response;
+    try {
+      response = await fetch(path, controller ? { ...fetchOptions, signal: controller.signal } : fetchOptions);
+    } catch (error) {
+      if (error.name === "AbortError") throw new Error("后台状态响应较慢，正在自动重试");
+      throw error;
+    } finally {
+      if (timeout) window.clearTimeout(timeout);
+    }
     const type = response.headers.get("content-type") || "";
     const payload = type.includes("application/json") ? await response.json() : await response.text();
     if (!response.ok) {
@@ -697,20 +712,34 @@
   }
 
   function stopPolling() {
+    pollGeneration += 1;
     if (pollTimer) {
-      window.clearInterval(pollTimer);
+      window.clearTimeout(pollTimer);
       pollTimer = null;
     }
   }
 
-  function startPolling(jobId) {
+  async function refreshCurrentStatus(jobId = currentJob) {
+    if (!jobId) return null;
+    refreshProgress.classList.add("is-refreshing");
+    try {
+      const payload = await api(`/api/job/${encodeURIComponent(jobId)}`, { timeoutMs: 8000 });
+      renderFullStatus(payload);
+      return payload;
+    } finally {
+      refreshProgress.classList.remove("is-refreshing");
+    }
+  }
+
+  function startPolling(jobId, immediate = true) {
     stopPolling();
+    const generation = pollGeneration;
     const tick = async () => {
+      let terminal = false;
       try {
-        const payload = await api(`/api/job/${encodeURIComponent(jobId)}`);
-        renderFullStatus(payload);
-        if (["done", "error", "paused"].includes(payload.state)) {
-          stopPolling();
+        const payload = await refreshCurrentStatus(jobId);
+        terminal = ["done", "error", "paused"].includes(payload?.state);
+        if (terminal) {
           runFull.disabled = Boolean(payload.outputCurrent);
           pauseFull.disabled = true;
           clearBusy();
@@ -718,9 +747,12 @@
       } catch (error) {
         progressDetail.textContent = error.message;
       }
+      if (!terminal && generation === pollGeneration) {
+        pollTimer = window.setTimeout(tick, 2500);
+      }
     };
-    tick();
-    pollTimer = window.setInterval(tick, 2500);
+    if (immediate) tick();
+    else pollTimer = window.setTimeout(tick, 2500);
   }
 
   pdfFile.addEventListener("change", () => {
@@ -884,6 +916,17 @@
 
   runFull.addEventListener("click", startFullRun);
   activateProgress.addEventListener("click", startFullRun);
+  refreshProgress.addEventListener("click", async () => {
+    refreshProgress.disabled = true;
+    try {
+      const payload = await refreshCurrentStatus();
+      if (payload?.backendActive) startPolling(currentJob, false);
+    } catch (error) {
+      progressDetail.textContent = error.message;
+    } finally {
+      refreshProgress.disabled = false;
+    }
+  });
 
   layoutMode.addEventListener("change", () => {
     rememberState();

@@ -845,6 +845,27 @@ button, input, select { font: inherit; }
   color: var(--cloud-deep);
 }
 
+.progress-refresh {
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  border: 1px solid rgba(47, 144, 185, .34);
+  border-radius: 50%;
+  background: rgba(255, 255, 255, .76);
+  color: var(--cloud-deep);
+  font-size: 20px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.progress-refresh:hover { background: rgba(47, 144, 185, .12); }
+.progress-refresh:disabled { cursor: wait; opacity: .6; }
+.progress-refresh.is-refreshing { animation: status-refresh-spin .8s linear infinite; }
+
+@keyframes status-refresh-spin {
+  to { transform: rotate(360deg); }
+}
+
 .work-motion {
   position: relative;
   min-height: 42px;
