@@ -2261,7 +2261,9 @@ def evaluate_ocr_coverage(image: Image.Image, items: list[dict], layout: str) ->
             recognized_chars = sum(len(canonical_output_text(str(item.get("text") or ""))) for item in matched_items)
             expected_chars = int(column.get("estimatedTextChars") or 0)
             column["recognizedChars"] = recognized_chars
-            if not column.get("dottedLeader") and expected_chars >= 6 and recognized_chars < expected_chars * .65:
+            # Traditional glyphs often split into two projected ink runs. Treat the
+            # estimate as a missing-text signal only when recognition is below half.
+            if not column.get("dottedLeader") and expected_chars >= 6 and recognized_chars < expected_chars * .48:
                 weak.append(column)
         else:
             missing.append(column)
@@ -2289,6 +2291,9 @@ def reevaluate_saved_ocr_coverage(coverage: dict, items: list[dict]) -> dict:
     missing = []
     weak = []
     for column in problems:
+        if not all(key in column for key in ("x0", "x1", "y0", "y1", "cx")):
+            weak.append(column)
+            continue
         col_width = max(1.0, float(column["x1"] - column["x0"]))
         tolerance = max(col_width * .7, image_width * .012)
         matched = []
@@ -2303,7 +2308,7 @@ def reevaluate_saved_ocr_coverage(coverage: dict, items: list[dict]) -> dict:
         recognized_chars = sum(len(canonical_output_text(str(item.get("text") or ""))) for item in matched)
         expected_chars = int(column.get("estimatedTextChars") or 0)
         updated = {**column, "recognizedChars": recognized_chars}
-        if not column.get("dottedLeader") and expected_chars >= 6 and recognized_chars < expected_chars * .65:
+        if not column.get("dottedLeader") and expected_chars >= 6 and recognized_chars < expected_chars * .48:
             weak.append(updated)
     expected = int(coverage.get("expectedColumns") or 0)
     covered = expected - len(missing)
@@ -3337,6 +3342,9 @@ def read_full_ocr_layout(job: dict, page_no: int, layout: str) -> dict | None:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
         if isinstance(payload.get("items"), list) and len(payload.get("imageSize") or []) == 2:
+            coverage = payload.get("coverage") or {}
+            if coverage and not coverage.get("complete", False):
+                payload["coverage"] = reevaluate_saved_ocr_coverage(coverage, payload.get("items") or [])
             return payload
     except (OSError, ValueError, TypeError, json.JSONDecodeError):
         pass

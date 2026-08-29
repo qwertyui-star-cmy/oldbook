@@ -405,6 +405,27 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(len(coverage["weakColumns"]), 1)
         self.assertFalse(coverage["complete"])
 
+    def test_saved_short_title_column_is_not_treated_as_missing_text(self):
+        column = {
+            "x0": 360, "x1": 400, "y0": 100, "y1": 1000, "cx": 380,
+            "estimatedTextChars": 14, "dottedLeader": False,
+        }
+        coverage = {
+            "mode": "ancient-vertical-columns-v1", "complete": False,
+            "expectedColumns": 1, "missingColumns": [], "weakColumns": [column],
+            "imageWidth": 800,
+        }
+        items = [{
+            "text": "武功赫赫德云布",
+            "box": [[360, 100], [400, 100], [400, 520], [360, 520]],
+            "score": 0.99,
+        }]
+
+        updated = engine.reevaluate_saved_ocr_coverage(coverage, items)
+
+        self.assertTrue(updated["complete"])
+        self.assertEqual(updated["weakColumns"], [])
+
     def test_ancient_vertical_coverage_does_not_count_toc_dots_as_missing_words(self):
         image = Image.new("L", (700, 1400), "white")
         draw = ImageDraw.Draw(image)
