@@ -15,6 +15,7 @@ from urllib.request import Request, urlopen
 from PIL import Image, ImageDraw
 from pypdf import PdfReader, PdfWriter
 from pypdf.generic import ContentStream
+from reportlab.pdfbase import pdfmetrics
 
 import server
 import text_layer_engine as engine
@@ -24,6 +25,11 @@ class EngineTests(unittest.TestCase):
     def test_final_text_layer_validation_ignores_punctuation(self):
         self.assertEqual(engine.expected_text_layer_norm("卷一・三，·《校勘》。"), "卷一三校勘")
         self.assertEqual(engine.canonical_output_text("卷一・三"), "卷一・三")
+
+    def test_extension_a_character_uses_a_font_that_contains_its_glyph(self):
+        font_name = engine.ensure_char_font("䂮")
+        font = pdfmetrics.getFont(font_name)
+        self.assertIn(ord("䂮"), font.face.charToGlyph)
 
     def test_job_id_cannot_escape_cache_root(self):
         with self.assertRaises(ValueError):

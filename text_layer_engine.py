@@ -94,6 +94,8 @@ TEXT_FONT = "HanText"
 TEXT_FONT_REGISTERED = False
 EXTB_TEXT_FONT = "HanTextExtB"
 EXTB_TEXT_FONT_REGISTERED = False
+FALLBACK_TEXT_FONT = "HanTextFallback"
+FALLBACK_TEXT_FONT_REGISTERED = False
 LAYOUT_ENGINE_VERSION = "next-page-start-v24-regional-ancient-ocr"
 ANCHOR_CACHE_VERSION = 12
 ANCHOR_BASE_DPI = 150
@@ -1396,21 +1398,42 @@ def ensure_text_font() -> str:
 
 
 def ensure_char_font(char: str) -> str:
-    global EXTB_TEXT_FONT_REGISTERED
-    if ord(char) <= 0xFFFF:
-        return ensure_text_font()
+    global EXTB_TEXT_FONT_REGISTERED, FALLBACK_TEXT_FONT_REGISTERED
+    primary = ensure_text_font()
+    primary_font = pdfmetrics.getFont(primary)
+    if ord(char) in getattr(getattr(primary_font, "face", None), "charToGlyph", {}):
+        return primary
+    if not FALLBACK_TEXT_FONT_REGISTERED:
+        for font_path in TEXT_FONT_CANDIDATES[1:]:
+            if not font_path.exists():
+                continue
+            try:
+                candidate = TTFont(FALLBACK_TEXT_FONT, str(font_path))
+                if ord(char) not in getattr(candidate.face, "charToGlyph", {}):
+                    continue
+                pdfmetrics.registerFont(candidate)
+                FALLBACK_TEXT_FONT_REGISTERED = True
+                return FALLBACK_TEXT_FONT
+            except Exception:
+                continue
+    elif ord(char) in getattr(pdfmetrics.getFont(FALLBACK_TEXT_FONT).face, "charToGlyph", {}):
+        return FALLBACK_TEXT_FONT
     if EXTB_TEXT_FONT_REGISTERED:
-        return EXTB_TEXT_FONT
+        if ord(char) in getattr(pdfmetrics.getFont(EXTB_TEXT_FONT).face, "charToGlyph", {}):
+            return EXTB_TEXT_FONT
     for font_path in EXTB_TEXT_FONT_CANDIDATES:
         if not font_path.exists():
             continue
         try:
-            pdfmetrics.registerFont(TTFont(EXTB_TEXT_FONT, str(font_path)))
+            candidate = TTFont(EXTB_TEXT_FONT, str(font_path))
+            if ord(char) not in getattr(candidate.face, "charToGlyph", {}):
+                continue
+            pdfmetrics.registerFont(candidate)
             EXTB_TEXT_FONT_REGISTERED = True
             return EXTB_TEXT_FONT
         except Exception:
             continue
-    return ensure_text_font()
+    return primary
 
 
 def runs(mask: list[bool], min_len: int = 5) -> list[tuple[int, int]]:
