@@ -129,6 +129,7 @@ NORMALIZED_SOURCE_CACHE: dict[int, tuple[str, str, list[int]]] = {}
 NORMALIZED_SOURCE_CACHE_LOCK = threading.Lock()
 SOURCE_SEARCH_CORPUS_CACHE: dict[str, str] = {}
 PDFIUM_DOCUMENTS: dict[tuple[str, int, int], object] = {}
+PAGE_LAYER_READERS: dict[str, PdfReader] = {}
 PIPELINE_STAGES = (
     ("input", "来源与任务检查"),
     ("ocr", "页边 OCR 缓存"),
@@ -2274,6 +2275,46 @@ def evaluate_ocr_coverage(image: Image.Image, items: list[dict], layout: str) ->
         "coveragePercent": round(100 * usable / max(1, expected), 1),
         "missingColumns": missing,
         "weakColumns": weak,
+        "imageWidth": image.width,
+        "inkRatio": image_ink_ratio(image),
+    }
+
+
+def reevaluate_saved_ocr_coverage(coverage: dict, items: list[dict]) -> dict:
+    """Recheck saved weak columns without rendering the 150 DPI base page again."""
+    image_width = int(coverage.get("imageWidth") or 0)
+    problems = list(coverage.get("missingColumns") or []) + list(coverage.get("weakColumns") or [])
+    item_bounds = [(item, bounds) for item in items if (bounds := ocr_item_bounds(item)) is not None]
+    missing = []
+    weak = []
+    for column in problems:
+        col_width = max(1.0, float(column["x1"] - column["x0"]))
+        tolerance = max(col_width * .7, image_width * .012)
+        matched = []
+        for item, (x0, y0, x1, y1) in item_bounds:
+            center = (x0 + x1) / 2
+            vertical_overlap = max(0.0, min(y1, column["y1"]) - max(y0, column["y0"]))
+            if abs(center - column["cx"]) <= tolerance and vertical_overlap >= min(y1 - y0, column["y1"] - column["y0"]) * .18:
+                matched.append(item)
+        if not matched:
+            missing.append(column)
+            continue
+        recognized_chars = sum(len(canonical_output_text(str(item.get("text") or ""))) for item in matched)
+        expected_chars = int(column.get("estimatedTextChars") or 0)
+        updated = {**column, "recognizedChars": recognized_chars}
+        if not column.get("dottedLeader") and expected_chars >= 6 and recognized_chars < expected_chars * .65:
+            weak.append(updated)
+    expected = int(coverage.get("expectedColumns") or 0)
+    covered = expected - len(missing)
+    usable = expected - len(missing) - len(weak)
+    return {
+        **coverage,
+        "complete": not missing and not weak,
+        "coveredColumns": covered,
+        "usableColumns": usable,
+        "coveragePercent": round(100 * usable / max(1, expected), 1),
+        "missingColumns": missing,
+        "weakColumns": weak,
     }
 
 
@@ -2348,7 +2389,7 @@ def supplement_missing_vertical_columns(image: Image.Image, items: list[dict], m
 def supplement_high_resolution_vertical_columns(
     pdf_path: Path,
     page_no: int,
-    base_image: Image.Image,
+    base_image: Image.Image | tuple[int, int],
     items: list[dict],
     columns: list[dict],
     dpi: int,
@@ -2358,6 +2399,8 @@ def supplement_high_resolution_vertical_columns(
     if not columns:
         return items
     merged = list(items)
+    reference_size = base_image.size if isinstance(base_image, Image.Image) else base_image
+    reference_width, reference_height = reference_size
     for column in columns:
         column_width = max(1, int(column["x1"] - column["x0"]))
         x_pad = max(10, round(column_width * .35))
@@ -2365,11 +2408,11 @@ def supplement_high_resolution_vertical_columns(
         box = (
             max(0, int(column["x0"]) - x_pad),
             max(0, int(column["y0"]) - y_pad),
-            min(base_image.width, int(column["x1"]) + x_pad),
-            min(base_image.height, int(column["y1"]) + y_pad),
+            min(reference_width, int(column["x1"]) + x_pad),
+            min(reference_height, int(column["y1"]) + y_pad),
         )
         region = render_page_region(
-            pdf_path, page_no, box, base_image.size, dpi=dpi, persistent=persistent
+            pdf_path, page_no, box, reference_size, dpi=dpi, persistent=persistent
         )
         box_width, box_height = max(1, box[2] - box[0]), max(1, box[3] - box[1])
         relative_column = {
@@ -2399,7 +2442,7 @@ def supplement_high_resolution_vertical_columns(
                 "origin": f"missing-column-{dpi}dpi",
             })
         if mapped_items:
-            tolerance = max(column_width * .7, base_image.width * .012)
+            tolerance = max(column_width * .7, reference_width * .012)
             retained = []
             for item in merged:
                 bounds = ocr_item_bounds(item)
@@ -3228,8 +3271,46 @@ def full_ocr_layout_path(job: dict, page_no: int, layout: str) -> Path:
 
 def full_ocr_base_path(job: dict, page_no: int, layout: str) -> Path:
     job_id = str(job.get("id") or "").strip()
-    cache_name = f"page-{page_no:04d}-ocr-base-v1-{layout}.json"
+    cache_name = f"page-{page_no:04d}-ocr-base-v2-{layout}.json"
     return job_paths(job_id).root / cache_name if job_id else Path(job["pdf"]).parent / cache_name
+
+
+def page_classification_cache_path(job: dict, page_no: int, layout: str) -> Path | None:
+    job_id = str(job.get("id") or "").strip()
+    cache_name = f"page-{page_no:04d}-classification-v1-{layout}.json"
+    if job_id:
+        return job_paths(job_id).root / cache_name
+    return Path(job["pdf"]).parent / cache_name if job.get("pdf") else None
+
+
+def cached_page_classification(job: dict, page_no: int, layout: str, text: str) -> dict | None:
+    path = page_classification_cache_path(job, page_no, layout)
+    if path is None:
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if (
+            payload.get("layout") == layout
+            and payload.get("inputFingerprint", "") == job.get("inputFingerprint", "")
+            and payload.get("textHash") == hashlib.sha1(text.encode("utf-8")).hexdigest()
+            and isinstance(payload.get("decision"), dict)
+        ):
+            return payload["decision"]
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        pass
+    return None
+
+
+def save_page_classification(job: dict, page_no: int, layout: str, text: str, decision: dict) -> None:
+    path = page_classification_cache_path(job, page_no, layout)
+    if path is None:
+        return
+    atomic_write_json(path, {
+        "layout": layout,
+        "inputFingerprint": job.get("inputFingerprint", ""),
+        "textHash": hashlib.sha1(text.encode("utf-8")).hexdigest(),
+        "decision": decision,
+    })
 
 
 def full_ocr_cache_ready(job: dict, page_no: int, layout: str) -> bool:
@@ -3258,8 +3339,9 @@ def adaptive_full_page_ocr(
 ) -> dict:
     """OCR once at base DPI, then spend high-resolution work on weak columns only."""
     render = render_page_images_persistent if persistent else render_page_images
-    base_image = render(pdf_path, [page_no], dpi=FULL_OCR_BASE_DPI)[0]
+    base_image = None if base_payload is not None else render(pdf_path, [page_no], dpi=FULL_OCR_BASE_DPI)[0]
     payload = dict(base_payload) if base_payload is not None else ocr_image_payload(base_image, layout, ancient_layout_aware=True)
+    reference_size = tuple(payload.get("imageSize") or (base_image.size if base_image is not None else (0, 0)))
     attempted_dpis = [FULL_OCR_BASE_DPI]
     regional_retries = []
     if layout.startswith("vertical") and not (payload.get("coverage") or {}).get("complete"):
@@ -3271,12 +3353,15 @@ def adaptive_full_page_ocr(
             if not unique_columns:
                 break
             items = supplement_high_resolution_vertical_columns(
-                pdf_path, page_no, base_image, items, list(unique_columns.values()),
+                pdf_path, page_no, reference_size, items, list(unique_columns.values()),
                 dpi=dpi, persistent=persistent,
             )
             attempted_dpis.append(dpi)
             regional_retries.append({"dpi": dpi, "columns": len(unique_columns)})
-            coverage = evaluate_ocr_coverage(base_image, items, layout)
+            coverage = (
+                evaluate_ocr_coverage(base_image, items, layout)
+                if base_image is not None else reevaluate_saved_ocr_coverage(coverage, items)
+            )
             payload.update({
                 "text": clean_ocr_text("\n".join(item["text"] for item in items)),
                 "items": items,
@@ -3286,7 +3371,18 @@ def adaptive_full_page_ocr(
                 break
 
         coverage = payload.get("coverage") or {}
-        if not coverage.get("complete") and needs_high_resolution_page_fallback(base_image, coverage):
+        fallback_needed = (
+            needs_high_resolution_page_fallback(base_image, coverage)
+            if base_image is not None else
+            (
+                int(coverage.get("expectedColumns") or 0) == 0
+                and float(coverage.get("inkRatio") or 0) >= .015
+            ) or (
+                len(coverage.get("missingColumns") or []) + len(coverage.get("weakColumns") or [])
+                >= max(4, math.ceil(int(coverage.get("expectedColumns") or 0) * .4))
+            )
+        )
+        if not coverage.get("complete") and fallback_needed:
             fallback_dpi = FULL_OCR_RETRY_DPIS[-1]
             high_image = render(pdf_path, [page_no], dpi=fallback_dpi)[0]
             payload = ocr_image_payload(high_image, layout, ancient_layout_aware=True)
@@ -4288,7 +4384,10 @@ def fill_non_authoritative_ocr(
     def apply_text(page_no: int, text: str) -> None:
         nonlocal completed
         item = by_page[page_no]
-        decision = classify_page(job, reader, page_no, layout, text)
+        decision = cached_page_classification(job, page_no, layout, text)
+        if decision is None:
+            decision = classify_page(job, reader, page_no, layout, text)
+            save_page_classification(job, page_no, layout, text, decision)
         geometry = read_full_ocr_layout(job, page_no, layout) or {}
         coverage = geometry.get("coverage") or {}
         if decision.get("kind") == "blank":
@@ -5588,6 +5687,21 @@ def write_page_layer(
     return True
 
 
+def write_page_layer_worker(payload: tuple[str, int, dict, str, str]) -> tuple[int, bool, str]:
+    job_id, page_no, row, layout, output_path = payload
+    try:
+        job = json.loads(job_paths(job_id).meta.read_text(encoding="utf-8"))
+        pdf_path = str(Path(job["pdf"]).resolve())
+        reader = PAGE_LAYER_READERS.get(pdf_path)
+        if reader is None:
+            reader = PdfReader(pdf_path, strict=False)
+            PAGE_LAYER_READERS[pdf_path] = reader
+        written = write_page_layer(job, reader, page_no, row, layout, Path(output_path))
+        return page_no, written, ""
+    except Exception as error:
+        return page_no, False, str(error)
+
+
 def build_review_pdf(job_id: str, layout: str = "auto") -> dict:
     """Build a clearly labeled inspection draft without relaxing the release gate."""
     paths = job_paths(job_id)
@@ -5993,29 +6107,70 @@ def build_full_pdf(job_id: str, layout: str, stop_after: int | None = None) -> d
 
     # Final publication only trusts pages revalidated against the finalized manifest.
     verified_pages.clear()
-    for page_no in range(1, page_count + 1):
-        page_out = page_dir / f"page-{page_no:05d}.pdf"
-        manifest_row = manifest[page_no - 1]
-        write_page_layer(job, reader, page_no, manifest_row, selected_layout, page_out)
-        verified_pages.add(page_no)
+    layer_workers = min(2, adaptive_ocr_workers(2)) if page_count >= 20 and stop_after is None else 1
+    if layer_workers == 1:
+        for page_no in range(1, page_count + 1):
+            page_out = page_dir / f"page-{page_no:05d}.pdf"
+            manifest_row = manifest[page_no - 1]
+            write_page_layer(job, reader, page_no, manifest_row, selected_layout, page_out)
+            verified_pages.add(page_no)
 
-        if page_no == 1 or page_no % 10 == 0 or page_no == page_count:
-            update_pipeline_stage(
-                job_id,
-                "layer",
-                "running",
-                state="running",
-                processed=page_no,
-                total=page_count,
-                currentPage=page_no,
-                detail=f"已确认并写入第 {page_no} 页",
-                message=f"正在完成剩余页面 {page_no} / {page_count}。",
-                alignment=alignment,
-            )
-        if read_full_status(job_id).get("pauseRequested"):
-            break
-        if stop_after and page_no >= stop_after:
-            break
+            if page_no == 1 or page_no % 10 == 0 or page_no == page_count:
+                update_pipeline_stage(
+                    job_id, "layer", "running", state="running",
+                    processed=page_no, total=page_count, currentPage=page_no,
+                    detail=f"已确认并写入第 {page_no} 页（1 路）",
+                    message=f"正在完成剩余页面 {page_no} / {page_count}。",
+                    alignment=alignment,
+                )
+            if read_full_status(job_id).get("pauseRequested"):
+                break
+            if stop_after and page_no >= stop_after:
+                break
+    else:
+        with concurrent.futures.ProcessPoolExecutor(max_workers=2) as pool:
+            page_queue = iter(range(1, page_count + 1))
+            pending: dict[concurrent.futures.Future, int] = {}
+
+            def fill_layer_queue() -> None:
+                nonlocal layer_workers
+                layer_workers = min(2, adaptive_ocr_workers(2))
+                while len(pending) < layer_workers:
+                    try:
+                        page_no = next(page_queue)
+                    except StopIteration:
+                        break
+                    page_out = page_dir / f"page-{page_no:05d}.pdf"
+                    pending[pool.submit(
+                        write_page_layer_worker,
+                        (job_id, page_no, manifest[page_no - 1], selected_layout, str(page_out)),
+                    )] = page_no
+
+            fill_layer_queue()
+            while pending:
+                done, _ = concurrent.futures.wait(tuple(pending), return_when=concurrent.futures.FIRST_COMPLETED)
+                for future in done:
+                    expected_page = pending.pop(future)
+                    page_no, _written, error = future.result()
+                    if error:
+                        raise RuntimeError(f"第 {expected_page} 页文字层写入失败：{error}")
+                    verified_pages.add(page_no)
+                completed_layers = len(verified_pages)
+                if completed_layers == 1 or completed_layers % 10 == 0 or completed_layers == page_count:
+                    update_pipeline_stage(
+                        job_id, "layer", "running", state="running",
+                        processed=completed_layers, total=page_count,
+                        currentPage=max(verified_pages),
+                        detail=f"已确认并写入 {completed_layers} / {page_count} 页（{len(pending)} 路活动）",
+                        message=f"正在并行完成文字层 {completed_layers} / {page_count}。",
+                        alignment=alignment,
+                        metrics={"currentWorkers": len(pending), "maxWorkers": 2},
+                    )
+                if read_full_status(job_id).get("pauseRequested"):
+                    for future in pending:
+                        future.cancel()
+                    break
+                fill_layer_queue()
 
     page_files = [page_dir / f"page-{page_no:05d}.pdf" for page_no in range(1, page_count + 1)]
     complete = len(verified_pages) == page_count

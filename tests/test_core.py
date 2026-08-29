@@ -499,7 +499,7 @@ class EngineTests(unittest.TestCase):
             "coverage": {"complete": False, "expectedColumns": 1, "missingColumns": [], "weakColumns": []},
         }
         with (
-            patch.object(engine, "render_page_images", return_value=[Image.new("RGB", (600, 900), "white")]),
+            patch.object(engine, "render_page_images", return_value=[Image.new("RGB", (600, 900), "white")]) as render,
             patch.object(engine, "ocr_image_payload") as base_ocr,
         ):
             payload = engine.adaptive_full_page_ocr(
@@ -507,8 +507,36 @@ class EngineTests(unittest.TestCase):
             )
 
         base_ocr.assert_not_called()
+        render.assert_not_called()
         self.assertEqual(payload["text"], "基础识别")
         self.assertEqual(payload["attemptedDpis"], [engine.FULL_OCR_BASE_DPI])
+
+    def test_saved_column_structure_can_be_rechecked_without_base_image(self):
+        column = {"x0": 380, "x1": 420, "y0": 100, "y1": 700, "cx": 400, "estimatedTextChars": 8}
+        coverage = {
+            "complete": False, "expectedColumns": 1, "coveredColumns": 0,
+            "missingColumns": [column], "weakColumns": [], "imageWidth": 800, "inkRatio": .12,
+        }
+        items = [{"text": "补识别文字足够", "box": [[380, 100], [420, 100], [420, 700], [380, 700]]}]
+
+        updated = engine.reevaluate_saved_ocr_coverage(coverage, items)
+
+        self.assertTrue(updated["complete"])
+        self.assertEqual(updated["missingColumns"], [])
+        self.assertEqual(updated["coveragePercent"], 100.0)
+
+    def test_page_classification_cache_is_bound_to_ocr_text(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            job = {"pdf": str(Path(temporary) / "book.pdf"), "inputFingerprint": "input-1"}
+            decision = {"kind": "blank", "reason": "空白页"}
+            engine.save_page_classification(job, 3, "vertical-single", "原文字", decision)
+
+            self.assertEqual(
+                engine.cached_page_classification(job, 3, "vertical-single", "原文字"), decision,
+            )
+            self.assertIsNone(
+                engine.cached_page_classification(job, 3, "vertical-single", "变化后的文字"),
+            )
 
     def test_word_style_frame_reduces_font_instead_of_overflowing(self):
         usable_w = 595 - 2 * (3 * 72 / 2.54)
