@@ -1197,12 +1197,30 @@ class EngineTests(unittest.TestCase):
         ):
             completed = engine.fill_non_authoritative_ocr({}, reader, manifest, "vertical-single")
 
-        self.assertEqual(completed, 1)
+        self.assertEqual(completed, 0)
         self.assertEqual(manifest[0]["kind"], "unresolved")
         self.assertEqual(manifest[0]["status"], "OCR 覆盖不完整")
         self.assertEqual(manifest[0]["text"], "")
         self.assertEqual(manifest[0]["textOrigin"], "page-ocr-incomplete")
         self.assertIn("2 条", manifest[0]["reason"])
+
+    def test_release_audit_requires_every_page_to_pass_a_terminal_gate(self):
+        manifest = [
+            {"page": 1, "kind": "body", "status": "页首与次页页首锁边"},
+            {"page": 2, "kind": "blank", "status": "空白页"},
+            {"page": 3, "kind": "ocr", "ocrCoverage": {"complete": True}},
+            {
+                "page": 4, "kind": "unresolved", "textOrigin": "page-ocr-incomplete",
+                "ocrAttempts": [150, 190, 230, engine.STUBBORN_FULL_OCR_DPI],
+            },
+        ]
+
+        audit = engine.manifest_release_audit(manifest, 4)
+
+        self.assertFalse(audit["releaseReady"])
+        self.assertEqual(audit["releasablePages"], 3)
+        self.assertEqual(audit["states"]["failed-review"], 1)
+        self.assertEqual(audit["pages"]["failed-review"], [4])
 
     def test_chapter_transition_title_page_can_attach_to_next_unit_prefix(self):
         previous_unit = engine.SourceUnit("志第一", "chapter-1", "前章正文结束", kind="epub")

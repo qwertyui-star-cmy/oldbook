@@ -4417,12 +4417,13 @@ def fill_non_authoritative_ocr(
         return 0
     by_page = {int(item["page"]): item for item in candidates}
     completed = 0
+    checked = 0
     started = time.time()
     worker_capacity = ocr_worker_capacity(3)
     current_worker_limit = adaptive_ocr_workers(worker_capacity)
 
     def apply_text(page_no: int, text: str) -> None:
-        nonlocal completed
+        nonlocal completed, checked
         item = by_page[page_no]
         decision = cached_page_classification(job, page_no, layout, text)
         if decision is None:
@@ -4443,6 +4444,7 @@ def fill_non_authoritative_ocr(
                 "kind": "unresolved", "status": "OCR 覆盖不完整", "text": "", "confidence": 0,
                 "sourceTitle": "本页 OCR", "sourceUrl": "", "textOrigin": "page-ocr-incomplete",
                 "ocrCoverage": coverage,
+                "ocrAttempts": list(geometry.get("attemptedDpis") or []),
                 "reason": f"原图仍有 {problem_count} 条明显文字列缺失或文字量异常；已阻止不完整文字进入成品。",
             })
         else:
@@ -4450,19 +4452,25 @@ def fill_non_authoritative_ocr(
                 "kind": "ocr", "status": "整页 OCR", "text": text, "confidence": 70 if text.strip() else 0,
                 "sourceTitle": "本页 OCR", "sourceUrl": "", "textOrigin": "page-ocr",
                 "ocrCoverage": coverage,
+                "ocrAttempts": list(geometry.get("attemptedDpis") or []),
                 "reason": "本页未进入权威文本层；整页 OCR 仅用于本页搜索，不参与任何权威页边界。",
             })
-        completed += 1
-        if status_job_id and (completed == 1 or completed % 5 == 0 or completed == len(candidates)):
+        checked += 1
+        if item.get("kind") in {"ocr", "blank"}:
+            completed += 1
+        if status_job_id and (checked == 1 or checked % 25 == 0 or checked == len(candidates)):
+            write_page_state_progress(status_job_id, manifest, "classify")
+        if status_job_id and (checked == 1 or checked % 5 == 0 or checked == len(candidates)):
             update_pipeline_stage(
                 status_job_id, "classify", "running", state="planning",
                 processed=completed, total=len(candidates), currentPage=page_no,
-                detail=f"非权威页整页 OCR {completed} / {len(candidates)}",
+                detail=f"通过发布门禁 {completed} / {len(candidates)}；已检查 {checked} 页",
                 metrics=throughput_metrics(
                     started, completed, len(candidates), workers=current_worker_limit,
                     currentWorkers=current_worker_limit, maxWorkers=worker_capacity,
+                    checkedPages=checked, retryRequired=max(0, checked - completed),
                 ),
-                message=f"权威页已经固定，正在处理纯 OCR 页 {completed} / {len(candidates)}。",
+                message=f"权威页已经固定，非权威页已有 {completed} / {len(candidates)} 页通过门禁。",
             )
 
     pending_pages = []
@@ -4572,9 +4580,17 @@ def fill_non_authoritative_ocr(
                     raise TaskPaused()
                 fill_queue(full_page_ocr_worker, retry_queue, "retry")
     if status_job_id:
+        write_page_state_progress(status_job_id, manifest, "classify-complete")
+        stage_state = "done" if completed == len(candidates) else "blocked"
         update_pipeline_stage(
-            status_job_id, "classify", "done", state="planning",
-            processed=completed, total=len(candidates), detail=f"纯 OCR/空白页处理完成，共 {completed} 页",
+            status_job_id, "classify", stage_state, state="planning",
+            processed=completed, total=len(candidates),
+            detail=(
+                f"纯 OCR/空白页全部通过，共 {completed} 页"
+                if stage_state == "done" else
+                f"已检查 {checked} 页；通过 {completed} 页，仍有 {len(candidates) - completed} 页未通过"
+            ),
+            metrics={"checkedPages": checked, "acceptedPages": completed, "retryRequired": len(candidates) - completed},
         )
     return completed
 
@@ -5514,6 +5530,63 @@ def cleanup_old_cache(days: int = 7) -> dict:
     return {"removed": removed}
 
 
+def page_release_state(row: dict) -> str:
+    kind = str(row.get("kind") or "")
+    if kind == "body":
+        return "authoritative"
+    if kind == "blank":
+        return "blank-exempt"
+    if kind == "ocr":
+        coverage = row.get("ocrCoverage") or {}
+        return "accepted" if not coverage or coverage.get("complete", False) else "retry-required"
+    if kind == "unresolved" and row.get("textOrigin") == "page-ocr-incomplete":
+        attempts = {int(value) for value in row.get("ocrAttempts") or [] if str(value).isdigit()}
+        return "failed-review" if STUBBORN_FULL_OCR_DPI in attempts else "retry-required"
+    return "unresolved-boundary"
+
+
+def manifest_release_audit(manifest: list[dict] | None, page_count: int) -> dict:
+    states = {
+        "authoritative": 0,
+        "blank-exempt": 0,
+        "accepted": 0,
+        "retry-required": 0,
+        "failed-review": 0,
+        "unresolved-boundary": 0,
+    }
+    pages_by_state = {state: [] for state in states}
+    for row in manifest or []:
+        state = page_release_state(row)
+        states[state] = states.get(state, 0) + 1
+        pages_by_state.setdefault(state, []).append(int(row.get("page") or 0))
+    accounted = sum(states.values())
+    releasable = states["authoritative"] + states["blank-exempt"] + states["accepted"]
+    return {
+        "version": 1,
+        "pageCount": page_count,
+        "accountedPages": accounted,
+        "releasablePages": releasable,
+        "releaseReady": accounted == page_count and releasable == page_count,
+        "states": states,
+        "pages": {state: pages for state, pages in pages_by_state.items() if pages},
+    }
+
+
+def write_page_state_progress(job_id: str, manifest: list[dict], phase: str) -> dict:
+    audit = manifest_release_audit(manifest, len(manifest))
+    atomic_write_json(job_paths(job_id).root / "page-state-progress.json", {
+        "version": 1,
+        "updatedAt": time.time(),
+        "phase": phase,
+        "audit": audit,
+        "stateByPage": {
+            str(int(row.get("page") or index + 1)): page_release_state(row)
+            for index, row in enumerate(manifest)
+        },
+    })
+    return audit
+
+
 def manifest_summary(manifest: list[dict] | None, page_count: int) -> dict:
     if not manifest:
         return {"matched": 0, "constrained": 0, "ocr": 0, "blank": 0, "sourceOmitted": 0, "sourceOmittedOcr": 0, "unresolved": page_count, "estimated": 0, "warnings": 0, "boundaryReview": 0, "reviewRequired": page_count, "averageConfidence": 0}
@@ -6088,9 +6161,24 @@ def build_full_pdf(job_id: str, layout: str, stop_after: int | None = None) -> d
             detail=f"已复用严格核对清单：锁定 {locked} 页，待核对 {unresolved} 页",
             metrics={"manifestReused": True, "locked": locked, "unresolved": unresolved},
         )
+    release_audit = manifest_release_audit(manifest, page_count)
+    atomic_write_json(paths.root / "page-state-diagnostics.json", {
+        "engineVersion": LAYOUT_ENGINE_VERSION,
+        "inputFingerprint": job.get("inputFingerprint", ""),
+        "layout": selected_layout,
+        "generatedAt": time.time(),
+        **release_audit,
+    })
+    release_states = release_audit["states"]
     blockers = []
-    if alignment["unresolved"] and not ALLOW_UNRESOLVED_OUTPUT:
-        blockers.append(f"{alignment['unresolved']} 页未锁定")
+    if release_states["retry-required"]:
+        blockers.append(f"{release_states['retry-required']} 页仍需 OCR 重试")
+    if release_states["failed-review"]:
+        blockers.append(f"{release_states['failed-review']} 页高分辨率 OCR 后仍需核对")
+    if release_states["unresolved-boundary"] and not ALLOW_UNRESOLVED_OUTPUT:
+        blockers.append(f"{release_states['unresolved-boundary']} 页未锁定")
+    if release_audit["accountedPages"] != page_count:
+        blockers.append(f"页面状态仅覆盖 {release_audit['accountedPages']} / {page_count} 页")
     if alignment["estimated"] and not ALLOW_ESTIMATED_OUTPUT:
         blockers.append(f"{alignment['estimated']} 页仍是估算范围")
     if alignment["boundaryReview"] and not ALLOW_UNRESOLVED_OUTPUT:
@@ -6113,9 +6201,9 @@ def build_full_pdf(job_id: str, layout: str, stop_after: int | None = None) -> d
             activeStage="align",
             processed=page_count,
             total=page_count,
-            message=f"处理未完成：{'、'.join(blockers)}。非权威页应自动转为整页 OCR，请重试任务。",
+            message=f"处理未完成：{'、'.join(blockers)}。不会发布不完整成品。",
             alignment=alignment,
-            validation={},
+            validation={"releaseAudit": release_audit},
             outputs=[],
         )
     if alignment["unresolved"]:
@@ -6258,6 +6346,7 @@ def build_full_pdf(job_id: str, layout: str, stop_after: int | None = None) -> d
                 validation = validate_full_output(pdf_path, building_pdf, manifest, status_job_id=job_id)
                 validation["visualRepair"] = {"attempted": True, "pages": error.pages}
             validation["assembly"] = assembly_backend
+            validation["releaseAudit"] = release_audit
             os.replace(building_pdf, final_pdf)
             stale_pdf.unlink(missing_ok=True)
         finally:
