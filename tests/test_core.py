@@ -44,6 +44,14 @@ class EngineTests(unittest.TestCase):
         font = pdfmetrics.getFont(font_name)
         self.assertIn(ord("∬"), font.face.charToGlyph)
 
+    def test_font_preflight_reports_unsupported_character_pages(self):
+        missing = engine.missing_text_layer_glyphs([
+            {"page": 2, "text": "正常\U0010ffff"},
+            {"page": 4, "text": "再次\U0010ffff"},
+        ])
+
+        self.assertEqual(missing["\U0010ffff"], [2, 4])
+
     def test_job_id_cannot_escape_cache_root(self):
         with self.assertRaises(ValueError):
             engine.job_paths("../../valuable")

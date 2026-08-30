@@ -1874,6 +1874,28 @@ def expected_text_layer_norm(text: str) -> str:
     )
 
 
+def missing_text_layer_glyphs(manifest: list[dict]) -> dict[str, list[int]]:
+    """Find non-punctuation characters that no configured PDF font can encode."""
+    missing: dict[str, list[int]] = {}
+    checked: dict[str, bool] = {}
+    for row in manifest:
+        page_no = int(row.get("page") or 0)
+        for char in canonical_output_text(str(row.get("text") or "")):
+            if unicodedata.category(char).startswith("P"):
+                continue
+            supported = checked.get(char)
+            if supported is None:
+                font_name = ensure_char_font(char)
+                font = pdfmetrics.getFont(font_name)
+                supported = ord(char) in getattr(getattr(font, "face", None), "charToGlyph", {})
+                checked[char] = supported
+            if not supported:
+                pages = missing.setdefault(char, [])
+                if page_no and page_no not in pages:
+                    pages.append(page_no)
+    return missing
+
+
 def page_text_from_sources(job: dict, page_no: int, layout: str | None = None, require_anchor_for_scan: bool = True) -> str:
     pdf_path = Path(job["pdf"])
     reader = PdfReader(str(pdf_path), strict=False)
@@ -6338,6 +6360,9 @@ def build_full_pdf(job_id: str, layout: str, stop_after: int | None = None) -> d
         "layout": selected_layout,
         "pages": manifest,
     })
+    if str(job.get("layout") or "") != selected_layout:
+        job["layout"] = selected_layout
+        atomic_write_json(paths.meta, job)
     if manifest_reused:
         unresolved = int(alignment.get("reviewRequired") or alignment.get("unresolved") or 0)
         locked = int(alignment.get("matched") or 0) + int(alignment.get("constrained") or 0)
@@ -6408,6 +6433,13 @@ def build_full_pdf(job_id: str, layout: str, stop_after: int | None = None) -> d
             alignment=alignment,
         )
 
+    missing_glyphs = missing_text_layer_glyphs(manifest)
+    if missing_glyphs:
+        samples = []
+        for char, page_numbers in list(missing_glyphs.items())[:12]:
+            samples.append(f"{char}（第 {','.join(map(str, page_numbers[:4]))} 页）")
+        raise ValueError(f"文字层字体预检发现无法编码的字符：{'、'.join(samples)}")
+
     manifest_hash = hashlib.sha1(
         f"{LAYOUT_ENGINE_VERSION}\n{json.dumps(manifest, ensure_ascii=False, sort_keys=True)}".encode("utf-8")
     ).hexdigest()
@@ -6474,9 +6506,21 @@ def build_full_pdf(job_id: str, layout: str, stop_after: int | None = None) -> d
                 done, _ = concurrent.futures.wait(tuple(pending), return_when=concurrent.futures.FIRST_COMPLETED)
                 for future in done:
                     expected_page = pending.pop(future)
-                    page_no, _written, error = future.result()
+                    try:
+                        page_no, _written, error = future.result()
+                    except Exception as worker_error:
+                        page_no, error = expected_page, str(worker_error)
                     if error:
-                        raise RuntimeError(f"第 {expected_page} 页文字层写入失败：{error}")
+                        page_out = page_dir / f"page-{expected_page:05d}.pdf"
+                        try:
+                            write_page_layer_resilient(
+                                job, reader, expected_page, manifest[expected_page - 1], selected_layout, page_out,
+                            )
+                            page_no = expected_page
+                        except Exception as fallback_error:
+                            raise RuntimeError(
+                                f"第 {expected_page} 页文字层写入失败；独立重建仍未恢复：{fallback_error}"
+                            ) from fallback_error
                     verified_pages.add(page_no)
                 completed_layers = len(verified_pages)
                 if completed_layers == 1 or completed_layers % 10 == 0 or completed_layers == page_count:
