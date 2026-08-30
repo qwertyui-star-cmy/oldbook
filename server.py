@@ -296,11 +296,17 @@ class AppHandler(SimpleHTTPRequestHandler):
     def receive_full(self):
         payload = self.read_json()
         job_id = str(payload.get("jobId", "")).strip()
-        layout = str(payload.get("layout", "auto"))
         paths = job_paths(job_id)
         if not paths.meta.exists():
             self.send_json({"error": "找不到这个任务，请重新导入。"}, status=404)
             return
+        job = json.loads(paths.meta.read_text(encoding="utf-8"))
+        requested_layout = str(payload.get("layout", "auto"))
+        saved_layout = str(job.get("layout") or "auto")
+        has_layout_cache = (paths.root / "page-text-manifest.json").is_file() or any(
+            paths.root.glob("page-*-ocr-anchors-*.json")
+        )
+        layout = saved_layout if saved_layout != "auto" and (requested_layout == "auto" or has_layout_cache) else requested_layout
         if completed_output_is_current(job_id, layout):
             status = self.public_job_status(job_id)
             status["message"] = "材料、版式和处理版本均未变化，已直接复用现有整本 PDF。"
