@@ -39,6 +39,11 @@ class EngineTests(unittest.TestCase):
         self.assertIn(ord("䂮"), font.face.charToGlyph)
         self.assertIn(ord("𠀀"), font.face.charToGlyph)
 
+    def test_math_symbol_uses_a_font_that_contains_its_glyph(self):
+        font_name = engine.ensure_char_font("∬")
+        font = pdfmetrics.getFont(font_name)
+        self.assertIn(ord("∬"), font.face.charToGlyph)
+
     def test_job_id_cannot_escape_cache_root(self):
         with self.assertRaises(ValueError):
             engine.job_paths("../../valuable")

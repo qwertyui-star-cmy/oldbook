@@ -96,6 +96,8 @@ EXTB_TEXT_FONT = "HanTextExtB"
 EXTB_TEXT_FONT_REGISTERED = False
 FALLBACK_TEXT_FONT = "HanTextFallback"
 FALLBACK_TEXT_FONT_REGISTERED = False
+SYMBOL_TEXT_FONT = "UnicodeSymbolFallback"
+SYMBOL_TEXT_FONT_REGISTERED = False
 LAYOUT_ENGINE_VERSION = "next-page-start-v24-regional-ancient-ocr"
 ANCHOR_CACHE_VERSION = 12
 ANCHOR_BASE_DPI = 150
@@ -117,6 +119,10 @@ EXTB_TEXT_FONT_CANDIDATES = [
 RARE_TEXT_FONT_CANDIDATES = [
     ROOT / "assets" / "fonts" / "BabelStoneHan.ttf",
     *TEXT_FONT_CANDIDATES[1:],
+]
+SYMBOL_TEXT_FONT_CANDIDATES = [
+    Path(r"C:\Windows\Fonts\seguisym.ttf"),
+    Path(r"C:\Windows\Fonts\cambria.ttc"),
 ]
 OCR_ENGINE = None
 OPENCC_CONVERTER = None
@@ -1402,7 +1408,7 @@ def ensure_text_font() -> str:
 
 
 def ensure_char_font(char: str) -> str:
-    global EXTB_TEXT_FONT_REGISTERED, FALLBACK_TEXT_FONT_REGISTERED
+    global EXTB_TEXT_FONT_REGISTERED, FALLBACK_TEXT_FONT_REGISTERED, SYMBOL_TEXT_FONT_REGISTERED
     primary = ensure_text_font()
     primary_font = pdfmetrics.getFont(primary)
     if ord(char) in getattr(getattr(primary_font, "face", None), "charToGlyph", {}):
@@ -1422,6 +1428,21 @@ def ensure_char_font(char: str) -> str:
                 continue
     elif ord(char) in getattr(pdfmetrics.getFont(FALLBACK_TEXT_FONT).face, "charToGlyph", {}):
         return FALLBACK_TEXT_FONT
+    if not SYMBOL_TEXT_FONT_REGISTERED:
+        for font_path in SYMBOL_TEXT_FONT_CANDIDATES:
+            if not font_path.exists():
+                continue
+            try:
+                candidate = TTFont(SYMBOL_TEXT_FONT, str(font_path))
+                if ord(char) not in getattr(candidate.face, "charToGlyph", {}):
+                    continue
+                pdfmetrics.registerFont(candidate)
+                SYMBOL_TEXT_FONT_REGISTERED = True
+                return SYMBOL_TEXT_FONT
+            except Exception:
+                continue
+    elif ord(char) in getattr(pdfmetrics.getFont(SYMBOL_TEXT_FONT).face, "charToGlyph", {}):
+        return SYMBOL_TEXT_FONT
     if EXTB_TEXT_FONT_REGISTERED:
         if ord(char) in getattr(pdfmetrics.getFont(EXTB_TEXT_FONT).face, "charToGlyph", {}):
             return EXTB_TEXT_FONT
@@ -5961,10 +5982,27 @@ def write_page_layer_worker(payload: tuple[str, int, dict, str, str]) -> tuple[i
         if reader is None:
             reader = PdfReader(pdf_path, strict=False)
             PAGE_LAYER_READERS[pdf_path] = reader
-        written = write_page_layer(job, reader, page_no, row, layout, Path(output_path))
+        written = write_page_layer_resilient(job, reader, page_no, row, layout, Path(output_path))
         return page_no, written, ""
     except Exception as error:
         return page_no, False, str(error)
+
+
+def write_page_layer_resilient(
+    job: dict,
+    reader: PdfReader,
+    page_no: int,
+    row: dict,
+    layout: str,
+    page_out: Path,
+) -> bool:
+    """Rebuild one failed intermediate page once before stopping the book."""
+    try:
+        return write_page_layer(job, reader, page_no, row, layout, page_out)
+    except Exception:
+        page_out.unlink(missing_ok=True)
+        page_out.with_suffix(".sha256").unlink(missing_ok=True)
+        return write_page_layer(job, reader, page_no, row, layout, page_out)
 
 
 def build_review_pdf(job_id: str, layout: str = "auto") -> dict:
@@ -6397,7 +6435,7 @@ def build_full_pdf(job_id: str, layout: str, stop_after: int | None = None) -> d
         for page_no in range(1, page_count + 1):
             page_out = page_dir / f"page-{page_no:05d}.pdf"
             manifest_row = manifest[page_no - 1]
-            write_page_layer(job, reader, page_no, manifest_row, selected_layout, page_out)
+            write_page_layer_resilient(job, reader, page_no, manifest_row, selected_layout, page_out)
             verified_pages.add(page_no)
 
             if page_no == 1 or page_no % 10 == 0 or page_no == page_count:
@@ -6492,7 +6530,7 @@ def build_full_pdf(job_id: str, layout: str, stop_after: int | None = None) -> d
                     page_out = page_dir / f"page-{page_no:05d}.pdf"
                     page_out.unlink(missing_ok=True)
                     page_out.with_suffix(".sha256").unlink(missing_ok=True)
-                    write_page_layer(job, reader, page_no, manifest[page_no - 1], selected_layout, page_out)
+                    write_page_layer_resilient(job, reader, page_no, manifest[page_no - 1], selected_layout, page_out)
                 building_pdf.unlink(missing_ok=True)
                 assembly_backend = assemble_page_pdfs(page_files, building_pdf)
                 validation = validate_full_output(pdf_path, building_pdf, manifest, status_job_id=job_id)
