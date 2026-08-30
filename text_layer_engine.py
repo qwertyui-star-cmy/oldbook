@@ -1870,7 +1870,7 @@ def draw_ocr_positioned_text(pdf_canvas, text: str, page_w: float, page_h: float
 def expected_text_layer_norm(text: str) -> str:
     return "".join(
         char for char in canonical_output_text(text)
-        if not unicodedata.category(char).startswith("P")
+        if not unicodedata.category(char).startswith(("P", "S"))
     )
 
 
@@ -1881,7 +1881,7 @@ def missing_text_layer_glyphs(manifest: list[dict]) -> dict[str, list[int]]:
     for row in manifest:
         page_no = int(row.get("page") or 0)
         for char in canonical_output_text(str(row.get("text") or "")):
-            if unicodedata.category(char).startswith("P"):
+            if unicodedata.category(char).startswith(("P", "S")):
                 continue
             supported = checked.get(char)
             if supported is None:

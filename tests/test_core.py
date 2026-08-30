@@ -24,7 +24,7 @@ import text_layer_engine as engine
 
 class EngineTests(unittest.TestCase):
     def test_final_text_layer_validation_ignores_punctuation(self):
-        self.assertEqual(engine.expected_text_layer_norm("卷一・三，·《校勘》。"), "卷一三校勘")
+        self.assertEqual(engine.expected_text_layer_norm("卷一・三，·《校勘》∬★。"), "卷一三校勘")
         self.assertEqual(engine.canonical_output_text("卷一・三"), "卷一・三")
 
     def test_extension_a_character_uses_a_font_that_contains_its_glyph(self):
@@ -51,6 +51,11 @@ class EngineTests(unittest.TestCase):
         ])
 
         self.assertEqual(missing["\U0010ffff"], [2, 4])
+
+    def test_font_preflight_accepts_unsupported_symbols(self):
+        missing = engine.missing_text_layer_glyphs([{"page": 2, "text": "正文∬★"}])
+
+        self.assertEqual(missing, {})
 
     def test_job_id_cannot_escape_cache_root(self):
         with self.assertRaises(ValueError):
