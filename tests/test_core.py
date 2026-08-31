@@ -108,6 +108,11 @@ class EngineTests(unittest.TestCase):
 
         self.assertEqual(missing, {})
 
+    def test_private_use_ocr_noise_is_removed_before_text_layer_writing(self):
+        self.assertEqual(engine.canonical_output_text("正文"), "正文")
+        self.assertEqual(engine.expected_text_layer_norm("正文"), "正文")
+        self.assertEqual(engine.missing_text_layer_glyphs([{"page": 2, "text": "正文"}]), {})
+
     def test_job_id_cannot_escape_cache_root(self):
         with self.assertRaises(ValueError):
             engine.job_paths("../../valuable")

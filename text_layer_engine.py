@@ -1731,7 +1731,12 @@ def draw_horizontal_text(pdf_canvas, text: str, page_w: float, page_h: float) ->
 
 
 def canonical_output_text(text: str) -> str:
-    return "".join(char for char in text if char != "\x00" and not char.isspace())
+    return "".join(
+        char for char in text
+        if char != "\x00"
+        and not char.isspace()
+        and unicodedata.category(char) != "Co"
+    )
 
 
 def word_frame_font_size(char_count: int, usable_w: float, usable_h: float, initial: float = 12.0) -> float:
