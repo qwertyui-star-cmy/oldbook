@@ -150,6 +150,22 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(result, (8, "恢复文字", ""))
         self.assertEqual(worker.call_count, 2)
 
+    def test_completed_manifest_is_reused_across_non_alignment_engine_upgrades(self):
+        payload = {
+            "engineVersion": "older-engine",
+            "layout": "horizontal",
+            "inputFingerprint": "same-input",
+            "pages": [
+                {"page": 1, "kind": "body", "text": "权威文字"},
+                {"page": 2, "kind": "ocr", "text": "OCR文字"},
+                {"page": 3, "kind": "blank", "text": ""},
+            ],
+        }
+
+        self.assertTrue(engine.completed_manifest_reusable(payload, 3, "horizontal", "same-input"))
+        payload["pages"][1] = {"page": 2, "kind": "unresolved", "text": ""}
+        self.assertFalse(engine.completed_manifest_reusable(payload, 3, "horizontal", "same-input"))
+
     def test_job_id_cannot_escape_cache_root(self):
         with self.assertRaises(ValueError):
             engine.job_paths("../../valuable")

@@ -5977,6 +5977,31 @@ def alignment_quality_regressed(current: dict, previous: dict | None, page_count
     return (
         current_review > previous_review + review_slack
         and current_locked < previous_locked - locked_slack
+    ) or current_locked < previous_locked - max(100, round(page_count * 0.1))
+
+
+def completed_manifest_reusable(
+    payload: object,
+    page_count: int,
+    layout: str,
+    input_fingerprint: str,
+) -> bool:
+    """Keep a finalized page assignment frozen across non-alignment engine upgrades."""
+    if not isinstance(payload, dict):
+        return False
+    pages = payload.get("pages")
+    if (
+        not isinstance(pages, list)
+        or len(pages) != page_count
+        or payload.get("layout") != layout
+        or payload.get("inputFingerprint") != input_fingerprint
+    ):
+        return False
+    if not manifest_release_audit(pages, page_count).get("releaseReady"):
+        return False
+    return all(
+        row.get("kind") == "blank" or bool(canonical_output_text(str(row.get("text") or "")))
+        for row in pages
     )
 
 
@@ -6421,14 +6446,18 @@ def build_full_pdf(job_id: str, layout: str, stop_after: int | None = None) -> d
             if (
                 isinstance(cached_pages, list)
                 and len(cached_pages) == page_count
-                and cached_payload.get("engineVersion") == LAYOUT_ENGINE_VERSION
                 and cached_payload.get("layout") == selected_layout
                 and cached_payload.get("inputFingerprint") == job.get("inputFingerprint")
-                and not any(
-                    row.get("kind") == "unresolved"
-                    and row.get("textOrigin") == "page-ocr-incomplete"
-                    for row in cached_pages
+                and (
+                    cached_payload.get("engineVersion") == LAYOUT_ENGINE_VERSION
+                    or completed_manifest_reusable(
+                        cached_payload,
+                        page_count,
+                        selected_layout,
+                        str(job.get("inputFingerprint") or ""),
+                    )
                 )
+                and not any(row.get("kind") == "unresolved" for row in cached_pages)
             ):
                 manifest = cached_pages
                 manifest_reused = True
