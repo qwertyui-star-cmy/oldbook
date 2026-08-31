@@ -106,8 +106,8 @@ FALLBACK_TEXT_FONT = "HanTextFallback"
 FALLBACK_TEXT_FONT_REGISTERED = False
 SYMBOL_TEXT_FONT = "UnicodeSymbolFallback"
 SYMBOL_TEXT_FONT_REGISTERED = False
-LAYOUT_ENGINE_VERSION = "next-page-start-v25-adaptive-footnote-anchors"
-ANCHOR_CACHE_VERSION = 13
+LAYOUT_ENGINE_VERSION = "next-page-start-v26-adjacent-fuzzy-recovery"
+ANCHOR_CACHE_VERSION = 14
 ANCHOR_BASE_DPI = 150
 ANCHOR_RETRY_DPI = 180
 FULL_OCR_BASE_DPI = 150
@@ -4484,6 +4484,58 @@ def page_start_needles(anchor_text: str) -> list[str]:
     return sorted(dict.fromkeys(needles), key=len, reverse=True)
 
 
+def fuzzy_edge_needles(anchor_text: str, side: str) -> list[str]:
+    """Build long OCR-tolerant edge needles while excluding isolated noise lines."""
+    candidates = []
+    for line in re.split(r"[\r\n]+", anchor_text):
+        line_norm, _ = normalize_for_match(line)
+        if len(line_norm) >= 12:
+            candidates.append(line_norm)
+    if not candidates:
+        normalized, _ = normalize_for_match(anchor_text)
+        if len(normalized) >= 12:
+            candidates.append(normalized)
+    needles = []
+    for candidate in candidates:
+        for size in (min(32, len(candidate)), 28, 24, 20, 18, 16, 14, 12):
+            if len(candidate) < size:
+                continue
+            needles.append(candidate[-size:] if side == "end" else candidate[:size])
+    return sorted(dict.fromkeys(needles), key=len, reverse=True)
+
+
+def unique_fuzzy_edge_hit(source_norm: str, anchor_text: str, side: str) -> tuple[int, int, int] | None:
+    """Find one long edge phrase with at most two OCR edits in a bounded source range."""
+    try:
+        from rapidfuzz.distance import Levenshtein
+    except ImportError:
+        return None
+    for needle in fuzzy_edge_needles(anchor_text, side):
+        max_errors = 1 if len(needle) < 18 else 2
+        hits = []
+        for position in range(len(source_norm)):
+            for span in range(max(1, len(needle) - max_errors), len(needle) + max_errors + 1):
+                if position + span > len(source_norm):
+                    continue
+                errors = Levenshtein.distance(
+                    needle, source_norm[position:position + span], score_cutoff=max_errors
+                )
+                if errors <= max_errors:
+                    hits.append((position, position + span, int(errors)))
+        if not hits:
+            continue
+        hits.sort(key=lambda item: (item[2], item[0], item[1]))
+        clusters = []
+        for hit in sorted(hits, key=lambda item: item[0]):
+            if not clusters or hit[0] - clusters[-1][-1][0] > max_errors + 1:
+                clusters.append([hit])
+            else:
+                clusters[-1].append(hit)
+        if len(clusters) == 1:
+            return min(clusters[0], key=lambda item: (item[2], abs((item[1] - item[0]) - len(needle))))
+    return None
+
+
 def unique_page_start_lock(
     units: list[SourceUnit],
     anchor_text: str,
@@ -5061,6 +5113,17 @@ def recover_unresolved_runs(
             page_text = strict_page_text_from_edges(
                 unit.text, mapping, ordered[offset], ordered[offset + 1], start_anchor, end_anchor
             )
+            if page_text is None and page_no < len(reader.pages):
+                next_start_anchor, _ = page_anchor_pair(job, reader, page_no + 1, layout)
+                page_text = fuzzy_page_slice_from_edges(
+                    unit.text,
+                    mapping,
+                    ordered[offset],
+                    ordered[offset + 1],
+                    start_anchor,
+                    end_anchor,
+                    next_start_anchor,
+                )
             if page_text is None:
                 page_slices = []
                 break
@@ -5273,10 +5336,40 @@ def bounded_page_anchor_hits(
     hits = []
     for side, anchor_text in (("start", start_text), ("end", end_text)):
         position, score, needle = line_anchor_evidence(segment, anchor_text, side)
-        if position is None or score < 44 or len(needle) < 6:
+        if position is not None and score >= 44 and len(needle) >= 6:
+            hits.append((side, start + position, start + position + len(needle), score))
             continue
-        hits.append((side, start + position, start + position + len(needle), score))
+        fuzzy = unique_fuzzy_edge_hit(segment, anchor_text, side)
+        if fuzzy is not None:
+            fuzzy_start, fuzzy_end, errors = fuzzy
+            hits.append((side, start + fuzzy_start, start + fuzzy_end, 90 - errors * 8))
     return hits
+
+
+def fuzzy_page_slice_from_edges(
+    source_text: str,
+    mapping: list[int],
+    start: int,
+    end: int,
+    start_anchor: str,
+    end_anchor: str,
+    next_start_anchor: str,
+) -> str | None:
+    """Accept a fuzzy boundary only when both page edges and the next page agree."""
+    source_norm, _ = normalize_for_match(source_text)
+    if not mapping or end <= start:
+        return None
+    head_end = min(end, start + 700)
+    tail_start = max(start, end - 700)
+    current_start = unique_fuzzy_edge_hit(source_norm[start:head_end], start_anchor, "start")
+    current_end = unique_fuzzy_edge_hit(source_norm[tail_start:end], end_anchor, "end")
+    next_end = min(len(source_norm), end + 700)
+    next_start = unique_fuzzy_edge_hit(source_norm[end:next_end], next_start_anchor, "start")
+    if current_start is None or current_end is None or next_start is None:
+        return None
+    if current_start[0] > 3 or end - (tail_start + current_end[1]) > 3 or next_start[0] > 3:
+        return None
+    return original_slice(source_text, mapping, start, end - 1).strip()
 
 
 def edge_evidence_cluster(evidence_pages: list[int], run_start: int, run_end: int, side: str) -> list[int]:

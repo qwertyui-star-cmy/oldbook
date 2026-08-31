@@ -43,6 +43,37 @@ class EngineTests(unittest.TestCase):
 
         self.assertEqual(needles, [engine.normalize_for_match("子曰君子不重")[0]])
 
+    def test_fuzzy_edge_hit_allows_two_ocr_errors_only_when_unique(self):
+        source = engine.normalize_for_match("遠方譯文用志同道合之人即本此義")[0]
+        anchor = "頁眉\n遠方譯文用志同道合之人即本此意"
+
+        self.assertIsNotNone(engine.unique_fuzzy_edge_hit(source, anchor, "start"))
+        self.assertIsNone(engine.unique_fuzzy_edge_hit(source + source, anchor, "start"))
+
+    def test_fuzzy_page_slice_keeps_continuation_before_chapter_number(self):
+        first = "遠方譯文用志同道合之人即本此義人不知這一句是本頁續文十二字"
+        middle = "12有子曰其為人也孝弟而好犯上者鮮矣"
+        following = "下一頁真實開頭文字必須同時參與邊界驗證"
+        source = first + middle + following
+        _, mapping = engine.normalize_for_match(source)
+        start = 0
+        end = len(engine.normalize_for_match(first + middle)[0])
+
+        text = engine.fuzzy_page_slice_from_edges(
+            source,
+            mapping,
+            start,
+            end,
+            "2\n論語譯注\n遠方譯文用志同道合之人即本此意",
+            "有子曰其為人也孝弟而好犯上者鮮也",
+            "下一頁真實開頭文字必須同時參與邊界驗證",
+        )
+
+        self.assertIsNotNone(text)
+        self.assertTrue(text.startswith("遠方"))
+        self.assertIn("12有子曰", engine.normalize_for_match(text)[0])
+        self.assertNotIn("下一頁", text)
+
     def test_final_text_layer_validation_ignores_punctuation(self):
         self.assertEqual(engine.expected_text_layer_norm("卷一・三，·《校勘》∬★。"), "卷一三校勘")
         self.assertEqual(engine.canonical_output_text("卷一・三"), "卷一・三")
