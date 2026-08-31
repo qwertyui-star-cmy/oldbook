@@ -107,7 +107,9 @@ FALLBACK_TEXT_FONT_REGISTERED = False
 SYMBOL_TEXT_FONT = "UnicodeSymbolFallback"
 SYMBOL_TEXT_FONT_REGISTERED = False
 LAYOUT_ENGINE_VERSION = "next-page-start-v26-adjacent-fuzzy-recovery"
-ANCHOR_CACHE_VERSION = 14
+# Matching rules can evolve without invalidating the expensive page-edge OCR.
+# Bump this only when the cached OCR payload itself changes shape or semantics.
+ANCHOR_CACHE_VERSION = 12
 ANCHOR_BASE_DPI = 150
 ANCHOR_RETRY_DPI = 180
 FULL_OCR_BASE_DPI = 150
