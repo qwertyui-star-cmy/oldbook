@@ -1737,7 +1737,8 @@ def canonical_output_text(text: str) -> str:
         char for char in text
         if char != "\x00"
         and not char.isspace()
-        and unicodedata.category(char) != "Co"
+        and not unicodedata.category(char).startswith("C")
+        and char != "\ufffd"
     )
 
 
@@ -3675,6 +3676,18 @@ def base_full_page_ocr_worker(payload: tuple[str, int, str]) -> tuple[int, bool,
         return page_no, False, "", str(error)
 
 
+def resilient_base_full_page_ocr_worker(payload: tuple[str, int, str]) -> tuple[int, bool, str, str]:
+    """Retry one transient base-pass failure in the same isolated worker."""
+    result = base_full_page_ocr_worker(payload)
+    return base_full_page_ocr_worker(payload) if result[3] else result
+
+
+def resilient_full_page_ocr_worker(payload: tuple[str, int, str]) -> tuple[int, str, str]:
+    """Retry one transient full-page OCR failure before escalating it."""
+    result = full_page_ocr_worker(payload)
+    return full_page_ocr_worker(payload) if result[2] else result
+
+
 def page_anchor_text(job: dict, reader: PdfReader, page_no: int, layout: str) -> str:
     job_id = str(job.get("id") or "").strip()
     if job_id and anchor_cache_ready(job_id, page_no, layout, str(job.get("inputFingerprint") or "")):
@@ -4793,7 +4806,7 @@ def fill_non_authoritative_ocr(
                         ),
                     )
 
-            fill_queue(base_full_page_ocr_worker, page_queue, "base")
+            fill_queue(resilient_base_full_page_ocr_worker, page_queue, "base")
             while pending:
                 done, _ = concurrent.futures.wait(tuple(pending), return_when=concurrent.futures.FIRST_COMPLETED)
                 for future in done:
@@ -4815,7 +4828,7 @@ def fill_non_authoritative_ocr(
                         pauseRequested=False,
                     )
                     raise TaskPaused()
-                fill_queue(base_full_page_ocr_worker, page_queue, "base")
+                fill_queue(resilient_base_full_page_ocr_worker, page_queue, "base")
 
             retry_queue = iter(sorted(complex_pages))
             if status_job_id and complex_pages:
@@ -4829,7 +4842,7 @@ def fill_non_authoritative_ocr(
                         activePages=[], queuePhase="retry", complexPages=len(complex_pages),
                     ),
                 )
-            fill_queue(full_page_ocr_worker, retry_queue, "retry")
+            fill_queue(resilient_full_page_ocr_worker, retry_queue, "retry")
             while pending:
                 done, _ = concurrent.futures.wait(tuple(pending), return_when=concurrent.futures.FIRST_COMPLETED)
                 for future in done:
@@ -4847,7 +4860,7 @@ def fill_non_authoritative_ocr(
                         pauseRequested=False,
                     )
                     raise TaskPaused()
-                fill_queue(full_page_ocr_worker, retry_queue, "retry")
+                fill_queue(resilient_full_page_ocr_worker, retry_queue, "retry")
     if status_job_id:
         write_page_state_progress(status_job_id, manifest, "classify-complete")
         stage_state = "done" if completed == len(candidates) else "blocked"
@@ -5572,7 +5585,7 @@ def fill_source_omitted_ocr(
                     except StopIteration:
                         break
                     pending[pool.submit(
-                        full_page_ocr_worker, (str(job.get("id") or ""), page_no, layout)
+                        resilient_full_page_ocr_worker, (str(job.get("id") or ""), page_no, layout)
                     )] = page_no
                 if status_job_id:
                     active_pages = sorted(pending.values())
@@ -6136,13 +6149,29 @@ def write_page_layer_resilient(
     layout: str,
     page_out: Path,
 ) -> bool:
-    """Rebuild one failed intermediate page once before stopping the book."""
+    """Rebuild a bad page cache and repair missing OCR geometry before retrying."""
     try:
         return write_page_layer(job, reader, page_no, row, layout, page_out)
-    except Exception:
+    except Exception as first_error:
         page_out.unlink(missing_ok=True)
         page_out.with_suffix(".sha256").unlink(missing_ok=True)
+        is_ocr_layer = row.get("kind") == "ocr" or row.get("textOrigin") == "page-ocr"
+        if is_ocr_layer and "缺少可用文字坐标" in str(first_error):
+            repair_full_ocr_geometry(job, page_no, layout)
         return write_page_layer(job, reader, page_no, row, layout, page_out)
+
+
+def repair_full_ocr_geometry(job: dict, page_no: int, layout: str) -> None:
+    """Regenerate one page's OCR geometry without changing its frozen manifest text."""
+    for path in (
+        full_ocr_layout_path(job, page_no, layout),
+        full_ocr_cache_path(job, page_no, layout),
+        full_ocr_base_path(job, page_no, layout),
+    ):
+        path.unlink(missing_ok=True)
+    payload = adaptive_full_page_ocr(Path(job["pdf"]), page_no, layout, persistent=True)
+    atomic_write_text(full_ocr_cache_path(job, page_no, layout), str(payload.get("text") or ""))
+    atomic_write_json(full_ocr_layout_path(job, page_no, layout), payload)
 
 
 def build_review_pdf(job_id: str, layout: str = "auto") -> dict:

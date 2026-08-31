@@ -97,11 +97,11 @@ class EngineTests(unittest.TestCase):
 
     def test_font_preflight_reports_unsupported_character_pages(self):
         missing = engine.missing_text_layer_glyphs([
-            {"page": 2, "text": "正常\U0010ffff"},
-            {"page": 4, "text": "再次\U0010ffff"},
+            {"page": 2, "text": "正常\U00010330"},
+            {"page": 4, "text": "再次\U00010330"},
         ])
 
-        self.assertEqual(missing["\U0010ffff"], [2, 4])
+        self.assertEqual(missing["\U00010330"], [2, 4])
 
     def test_font_preflight_accepts_unsupported_symbols(self):
         missing = engine.missing_text_layer_glyphs([{"page": 2, "text": "正文∬★"}])
@@ -112,6 +112,43 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(engine.canonical_output_text("正文"), "正文")
         self.assertEqual(engine.expected_text_layer_norm("正文"), "正文")
         self.assertEqual(engine.missing_text_layer_glyphs([{"page": 2, "text": "正文"}]), {})
+
+    def test_non_text_unicode_noise_is_removed_before_text_layer_writing(self):
+        noisy = "正\u200b\ufffd\U0010ffff文"
+
+        self.assertEqual(engine.canonical_output_text(noisy), "正文")
+        self.assertEqual(engine.missing_text_layer_glyphs([{"page": 2, "text": noisy}]), {})
+
+    def test_missing_ocr_geometry_is_rebuilt_before_page_write_retry(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "page.pdf"
+            row = {"kind": "ocr", "text": "本页文字"}
+            with (
+                patch.object(
+                    engine,
+                    "write_page_layer",
+                    side_effect=[ValueError("非权威 OCR 页缺少可用文字坐标"), True],
+                ) as write,
+                patch.object(engine, "repair_full_ocr_geometry") as repair,
+            ):
+                rebuilt = engine.write_page_layer_resilient(
+                    {"pdf": "book.pdf"}, object(), 12, row, "vertical-double", output
+                )
+
+        self.assertTrue(rebuilt)
+        self.assertEqual(write.call_count, 2)
+        repair.assert_called_once_with({"pdf": "book.pdf"}, 12, "vertical-double")
+
+    def test_transient_full_page_ocr_failure_is_retried_once(self):
+        with patch.object(
+            engine,
+            "full_page_ocr_worker",
+            side_effect=[(8, "", "temporary failure"), (8, "恢复文字", "")],
+        ) as worker:
+            result = engine.resilient_full_page_ocr_worker(("job", 8, "horizontal"))
+
+        self.assertEqual(result, (8, "恢复文字", ""))
+        self.assertEqual(worker.call_count, 2)
 
     def test_job_id_cannot_escape_cache_root(self):
         with self.assertRaises(ValueError):
