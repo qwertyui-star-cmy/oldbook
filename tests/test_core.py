@@ -1094,6 +1094,21 @@ class EngineTests(unittest.TestCase):
         ):
             self.assertEqual(engine.adaptive_ocr_workers(), 3)
 
+    def test_layer_workers_use_lighter_memory_budget_than_ocr(self):
+        with (
+            patch.object(engine, "available_memory_mb", return_value=4600),
+            patch.object(engine.os, "cpu_count", return_value=12),
+        ):
+            self.assertEqual(engine.adaptive_ocr_workers(4), 2)
+            self.assertEqual(engine.adaptive_layer_workers(4), 4)
+
+    def test_layer_worker_override_only_reduces_the_safe_cap(self):
+        with (
+            patch.dict(engine.os.environ, {"TEXT_LAYER_WRITE_WORKERS": "3"}),
+            patch.object(engine.os, "cpu_count", return_value=16),
+        ):
+            self.assertEqual(engine.layer_worker_capacity(4), 3)
+
     def test_anchor_worker_retries_high_dpi_when_low_dpi_evidence_is_weak(self):
         with tempfile.TemporaryDirectory() as temporary, patch.object(engine, "JOBS_DIR", Path(temporary)):
             job_id = "1122334455667788"

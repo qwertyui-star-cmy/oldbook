@@ -3058,6 +3058,28 @@ def adaptive_ocr_workers(requested: int | None = None) -> int:
     return max(1, automatic)
 
 
+def layer_worker_capacity(requested: int = 4) -> int:
+    """Return a conservative cap for lightweight, isolated PDF page writers."""
+    logical_cpus = os.cpu_count() or 4
+    capacity = max(1, min(4, logical_cpus - 2, max(2, logical_cpus // 2)))
+    override = str(os.environ.get("TEXT_LAYER_WRITE_WORKERS") or "").strip()
+    if override.isdigit():
+        capacity = min(capacity, max(1, int(override)))
+    return max(1, min(capacity, requested))
+
+
+def adaptive_layer_workers(requested: int = 4) -> int:
+    """Scale page writers independently from memory-heavy OCR workers."""
+    automatic = layer_worker_capacity(requested)
+    available_mb = available_memory_mb()
+    if available_mb:
+        # Each writer reuses one source reader. Reserve 2 GiB for Windows and
+        # budget 512 MiB per writer for large-page object graphs and fonts.
+        memory_limit = max(1, min(4, int(max(0, available_mb - 2048) // 512)))
+        automatic = min(automatic, memory_limit)
+    return max(1, automatic)
+
+
 def available_memory_mb() -> int:
     try:
         if os.name == "nt":
@@ -6638,7 +6660,8 @@ def build_full_pdf(job_id: str, layout: str, stop_after: int | None = None) -> d
 
     # Final publication only trusts pages revalidated against the finalized manifest.
     verified_pages.clear()
-    layer_workers = min(2, adaptive_ocr_workers(2)) if page_count >= 20 and stop_after is None else 1
+    layer_capacity = layer_worker_capacity(4) if page_count >= 20 and stop_after is None else 1
+    layer_workers = adaptive_layer_workers(layer_capacity) if layer_capacity > 1 else 1
     if layer_workers == 1:
         for page_no in range(1, page_count + 1):
             page_out = page_dir / f"page-{page_no:05d}.pdf"
@@ -6659,13 +6682,13 @@ def build_full_pdf(job_id: str, layout: str, stop_after: int | None = None) -> d
             if stop_after and page_no >= stop_after:
                 break
     else:
-        with concurrent.futures.ProcessPoolExecutor(max_workers=2) as pool:
+        with concurrent.futures.ProcessPoolExecutor(max_workers=layer_capacity) as pool:
             page_queue = iter(range(1, page_count + 1))
             pending: dict[concurrent.futures.Future, int] = {}
 
             def fill_layer_queue() -> None:
                 nonlocal layer_workers
-                layer_workers = min(2, adaptive_ocr_workers(2))
+                layer_workers = adaptive_layer_workers(layer_capacity)
                 while len(pending) < layer_workers:
                     try:
                         page_no = next(page_queue)
@@ -6707,7 +6730,7 @@ def build_full_pdf(job_id: str, layout: str, stop_after: int | None = None) -> d
                         detail=f"已确认并写入 {completed_layers} / {page_count} 页（{len(pending)} 路活动）",
                         message=f"正在并行完成文字层 {completed_layers} / {page_count}。",
                         alignment=alignment,
-                        metrics={"currentWorkers": len(pending), "maxWorkers": 2},
+                        metrics={"currentWorkers": len(pending), "maxWorkers": layer_capacity},
                     )
                 if read_full_status(job_id).get("pauseRequested"):
                     for future in pending:
