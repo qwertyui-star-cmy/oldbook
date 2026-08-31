@@ -4458,12 +4458,22 @@ def build_legacy_strict_page_manifest(
 
 
 def page_start_needles(anchor_text: str) -> list[str]:
-    """Return longest-first normalized prefixes from the physical page start."""
+    """Return page-start candidates without letting short header noise poison every prefix."""
+    candidates = []
     normalized, _ = normalize_for_match(anchor_text)
-    if len(normalized) < 6:
-        return []
-    sizes = [min(32, len(normalized)), 28, 24, 20, 18, 16, 14, 12, 10, 8, 6]
-    return list(dict.fromkeys(normalized[:size] for size in sizes if len(normalized) >= size))
+    for line in re.split(r"[\r\n]+", anchor_text):
+        line_norm, _ = normalize_for_match(line)
+        if len(line_norm) >= 6:
+            candidates.append(line_norm)
+    if not candidates and len(normalized) >= 6:
+        candidates.append(normalized)
+    needles = []
+    for candidate in candidates:
+        sizes = [min(32, len(candidate)), 28, 24, 20, 18, 16, 14, 12, 10, 8, 6]
+        for size in sizes:
+            if len(candidate) >= size:
+                needles.append(candidate[:size])
+    return sorted(dict.fromkeys(needles), key=len, reverse=True)
 
 
 def unique_page_start_lock(

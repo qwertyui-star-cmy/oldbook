@@ -23,6 +23,12 @@ import text_layer_engine as engine
 
 
 class EngineTests(unittest.TestCase):
+    def test_page_start_needles_skip_short_ocr_header_noise(self):
+        needles = engine.page_start_needles("口\n品口\n￥\n工\n（五）關於忠恕和仁")
+
+        self.assertIn(engine.normalize_for_match("五關於忠恕和仁")[0], needles)
+        self.assertFalse(any(needle.startswith("口品口") for needle in needles if len(needle) <= 8))
+
     def test_final_text_layer_validation_ignores_punctuation(self):
         self.assertEqual(engine.expected_text_layer_norm("卷一・三，·《校勘》∬★。"), "卷一三校勘")
         self.assertEqual(engine.canonical_output_text("卷一・三"), "卷一・三")
