@@ -29,6 +29,20 @@ class EngineTests(unittest.TestCase):
         self.assertIn(engine.normalize_for_match("五關於忠恕和仁")[0], needles)
         self.assertFalse(any(needle.startswith("口品口") for needle in needles if len(needle) <= 8))
 
+    def test_page_anchor_matching_ignores_inline_epub_footnote_markers(self):
+        scan_text = "1·8子曰君子不重則不威學則不固主忠信"
+        epub_text = "1·8子曰君子⑴不重则不威学则不固主忠信⑵"
+
+        self.assertEqual(
+            engine.normalize_for_match(scan_text)[0],
+            engine.normalize_for_match(epub_text)[0],
+        )
+
+    def test_short_page_anchor_remains_available_as_a_fallback(self):
+        needles = engine.page_start_needles("子曰君子不重")
+
+        self.assertEqual(needles, [engine.normalize_for_match("子曰君子不重")[0]])
+
     def test_final_text_layer_validation_ignores_punctuation(self):
         self.assertEqual(engine.expected_text_layer_norm("卷一・三，·《校勘》∬★。"), "卷一三校勘")
         self.assertEqual(engine.canonical_output_text("卷一・三"), "卷一・三")

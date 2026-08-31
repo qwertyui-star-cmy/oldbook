@@ -90,6 +90,14 @@ JOBS_DIR = ROOT / ".cache" / "text-layer-jobs"
 POPPLER = Path.home() / ".cache" / "codex-runtimes" / "codex-primary-runtime" / "dependencies" / "native" / "poppler" / "Library" / "bin" / "pdftoppm.exe"
 CN_PUNCT = "，。！？；：、“”‘’（）《》〈〉【】〔〕［］—…·　「」『』﹁﹂﹃﹄"
 SKIP_CHARS = set(punctuation + CN_PUNCT)
+# EPUB editions often inject circled or parenthesized footnote numbers inside a
+# sentence. Ignore them only while matching so a long page anchor is not forced
+# to fall back to an ambiguous short prefix; preserve them in the output text.
+MATCH_ONLY_FOOTNOTE_MARKERS = {
+    chr(codepoint)
+    for start, end in ((0x2460, 0x2473), (0x2474, 0x2487))
+    for codepoint in range(start, end + 1)
+}
 TEXT_FONT = "HanText"
 TEXT_FONT_REGISTERED = False
 EXTB_TEXT_FONT = "HanTextExtB"
@@ -98,8 +106,8 @@ FALLBACK_TEXT_FONT = "HanTextFallback"
 FALLBACK_TEXT_FONT_REGISTERED = False
 SYMBOL_TEXT_FONT = "UnicodeSymbolFallback"
 SYMBOL_TEXT_FONT_REGISTERED = False
-LAYOUT_ENGINE_VERSION = "next-page-start-v24-regional-ancient-ocr"
-ANCHOR_CACHE_VERSION = 12
+LAYOUT_ENGINE_VERSION = "next-page-start-v25-adaptive-footnote-anchors"
+ANCHOR_CACHE_VERSION = 13
 ANCHOR_BASE_DPI = 150
 ANCHOR_RETRY_DPI = 180
 FULL_OCR_BASE_DPI = 150
@@ -1930,7 +1938,7 @@ def normalize_for_match(text: str) -> tuple[str, list[int]]:
     chars = []
     mapping = []
     for index, char in enumerate(text):
-        if char.isspace() or char in SKIP_CHARS:
+        if char.isspace() or char in SKIP_CHARS or char in MATCH_ONLY_FOOTNOTE_MARKERS:
             continue
         chars.append(normalize_cjk_variant(char))
         mapping.append(index)
